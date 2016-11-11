@@ -12,14 +12,35 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 ################################################################################
 # enable solution folders for MSVC
+################################################################################
 if(MSVC)
     set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 endif()
 
 ################################################################################
+# options
+################################################################################
+option(OCTOTIGER_WITH_SILO "Enable support for Silo output" ON)
+
+################################################################################
+# Find required packages
+################################################################################
 find_package(HPX REQUIRED NO_CMAKE_PACKAGE_REGISTRY)
 find_package(MPI REQUIRED)
-find_package(Silo REQUIRED)
+if (OCTOTIGER_WITH_SILO)
+  find_package(Silo REQUIRED)
+endif()
+
+
+################################################################################
+# Silo support
+################################################################################
+if (OCTOTIGER_WITH_SILO)
+  add_definitions(-DOCTOTIGER_HAVE_SILO)
+else()
+  set(Silo_LIBRARY "" CACHE STRING "" FORCE)
+  set(Silo_INCLUDE_DIR "" CACHE STRING "" FORCE)
+endif()
 
 ################################################################################
 include_directories(${CMAKE_SOURCE_DIR}/src ~/include ${Silo_INCLUDE_DIR})
