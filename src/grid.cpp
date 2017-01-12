@@ -1,15 +1,18 @@
+#include "future.hpp"
 #include "grid.hpp"
 #include "problem.hpp"
 #include "options.hpp"
-#include <cmath>
-#include <cassert>
 #include "profiler.hpp"
 #include "taylor.hpp"
 //#include "helmholtz.hpp"
-#include <boost/thread/tss.hpp>
 #include "node_server.hpp"
 #include "exact_sod.hpp"
+
+#include <cmath>
+#include <cassert>
+
 #include <hpx/include/runtime.hpp>
+
 extern options opts;
 
 char const* grid::field_names[] = { "rho", "egas", "sx", "sy", "sz", "tau", "pot", "zx", "zy", "zz", "primary_core", "primary_envelope", "secondary_core",
@@ -31,6 +34,10 @@ struct tls_data_t {
 
 real grid::Acons = 1.0;
 real grid::Bcons = 1.0;
+
+#if !defined(_MSC_VER)
+
+#include <boost/thread/tss.hpp>
 
 class tls_t {
 private:
@@ -57,6 +64,42 @@ public:
 		return ptr;
 	}
 };
+
+#else
+#include <hpx/util/thread_specific_ptr.hpp>
+
+class tls_t
+{
+private:
+    struct tls_data_tag {};
+    static hpx::util::thread_specific_ptr<tls_data_t, tls_data_tag> data;
+
+public:
+//     static void cleanup(void* ptr)
+//     {
+//         tls_data_t* _ptr = (tls_data_t*) ptr;
+//         delete _ptr;
+//     }
+
+    tls_data_t* get_ptr()
+    {
+        tls_data_t* ptr = data.get();
+        if (ptr == nullptr) {
+            ptr = new tls_data_t;
+            ptr->v.resize(NF, std::vector < real > (H_N3));
+            ptr->zz.resize(NDIM, std::vector < real > (H_N3));
+            ptr->dvdx.resize(NDIM, std::vector < std::vector < real >> (NF, std::vector < real > (H_N3)));
+            ptr->dudx.resize(NDIM, std::vector < std::vector < real >> (NF, std::vector < real > (H_N3)));
+            ptr->uf.resize(NFACE, std::vector < std::vector < real >> (NF, std::vector < real > (H_N3)));
+            data.reset(ptr);
+        }
+        return ptr;
+    }
+};
+
+hpx::util::thread_specific_ptr<tls_data_t, tls_t::tls_data_tag> tls_t::data;
+
+#endif
 
 static tls_t tls;
 
@@ -216,8 +259,8 @@ std::pair<std::vector<real>, std::vector<real>> grid::diagnostic_error() const {
 					for (integer l = 0; l != 4; ++l) {
 						e.first[l] += std::abs(a[l] - n[l]) * dV * rho;
 						e.first[4 + l] += std::abs(a[l]) * dV * rho;
-						e.second[l] += std::pow((a[l] - n[l]) * rho, 2) * dV;
-						e.second[4 + l] += std::pow(a[l] * rho, 2) * dV;
+						e.second[l] += sqr((a[l] - n[l]) * rho) * dV;
+						e.second[4 + l] += sqr(a[l] * rho) * dV;
 					}
 				}
 			}
@@ -271,7 +314,14 @@ void grid::set_pivot(const space_vector& p) {
 }
 
 inline real minmod(real a, real b) {
-	return (std::copysign(HALF, a) + std::copysign(HALF, b)) * std::min(std::abs(a), std::abs(b));
+//    return (std::copysign(HALF, a) + std::copysign(HALF, b)) * std::min(std::abs(a), std::abs(b));
+    bool a_is_neg = a < 0;
+    bool b_is_neg = b < 0;
+    if (a_is_neg != b_is_neg)
+        return ZERO;
+
+    real val = std::min(std::abs(a), std::abs(b));
+    return a_is_neg ? -val : val;
 }
 
 inline real minmod_theta(real a, real b, real c, real theta) {
@@ -308,68 +358,70 @@ std::vector<real> grid::get_flux_restrict(const std::array<integer, NDIM>& lb, c
 					value += F[dim][field][i01];
 					value += F[dim][field][i11];
 					const real f = dx / TWO;
-					if (field == zx_i) {
-						if (dim == YDIM) {
-							value += F[dim][sy_i][i00] * f;
-							value += F[dim][sy_i][i10] * f;
-							value -= F[dim][sy_i][i01] * f;
-							value -= F[dim][sy_i][i11] * f;
-						} else if (dim == ZDIM) {
-							value -= F[dim][sz_i][i00] * f;
-							value -= F[dim][sz_i][i10] * f;
-							value += F[dim][sz_i][i01] * f;
-							value += F[dim][sz_i][i11] * f;
-						} else if (dim == XDIM) {
-							value += F[dim][sy_i][i00] * f;
-							value += F[dim][sy_i][i10] * f;
-							value -= F[dim][sy_i][i01] * f;
-							value -= F[dim][sy_i][i11] * f;
-							value -= F[dim][sz_i][i00] * f;
-							value += F[dim][sz_i][i10] * f;
-							value -= F[dim][sz_i][i01] * f;
-							value += F[dim][sz_i][i11] * f;
-						}
-					} else if (field == zy_i) {
-						if (dim == XDIM) {
-							value -= F[dim][sx_i][i00] * f;
-							value -= F[dim][sx_i][i10] * f;
-							value += F[dim][sx_i][i01] * f;
-							value += F[dim][sx_i][i11] * f;
-						} else if (dim == ZDIM) {
-							value += F[dim][sz_i][i00] * f;
-							value -= F[dim][sz_i][i10] * f;
-							value += F[dim][sz_i][i01] * f;
-							value -= F[dim][sz_i][i11] * f;
-						} else if (dim == YDIM) {
-							value -= F[dim][sx_i][i00] * f;
-							value -= F[dim][sx_i][i10] * f;
-							value += F[dim][sx_i][i01] * f;
-							value += F[dim][sx_i][i11] * f;
-							value += F[dim][sz_i][i00] * f;
-							value -= F[dim][sz_i][i10] * f;
-							value += F[dim][sz_i][i01] * f;
-							value -= F[dim][sz_i][i11] * f;
-						}
-					} else if (field == zz_i) {
-						if (dim == XDIM) {
-							value += F[dim][sx_i][i00] * f;
-							value -= F[dim][sx_i][i10] * f;
-							value += F[dim][sx_i][i01] * f;
-							value -= F[dim][sx_i][i11] * f;
-						} else if (dim == YDIM) {
-							value -= F[dim][sy_i][i00] * f;
-							value += F[dim][sy_i][i10] * f;
-							value -= F[dim][sy_i][i01] * f;
-							value += F[dim][sy_i][i11] * f;
-						} else if (dim == ZDIM) {
-							value -= F[dim][sy_i][i00] * f;
-							value += F[dim][sy_i][i10] * f;
-							value -= F[dim][sy_i][i01] * f;
-							value += F[dim][sy_i][i11] * f;
-							value += F[dim][sx_i][i00] * f;
-							value += F[dim][sx_i][i10] * f;
-							value -= F[dim][sx_i][i01] * f;
-							value -= F[dim][sx_i][i11] * f;
+					if (opts.ang_con) {
+						if (field == zx_i) {
+							if (dim == YDIM) {
+								value += F[dim][sy_i][i00] * f;
+								value += F[dim][sy_i][i10] * f;
+								value -= F[dim][sy_i][i01] * f;
+								value -= F[dim][sy_i][i11] * f;
+							} else if (dim == ZDIM) {
+								value -= F[dim][sz_i][i00] * f;
+								value -= F[dim][sz_i][i10] * f;
+								value += F[dim][sz_i][i01] * f;
+								value += F[dim][sz_i][i11] * f;
+							} else if (dim == XDIM) {
+								value += F[dim][sy_i][i00] * f;
+								value += F[dim][sy_i][i10] * f;
+								value -= F[dim][sy_i][i01] * f;
+								value -= F[dim][sy_i][i11] * f;
+								value -= F[dim][sz_i][i00] * f;
+								value += F[dim][sz_i][i10] * f;
+								value -= F[dim][sz_i][i01] * f;
+								value += F[dim][sz_i][i11] * f;
+							}
+						} else if (field == zy_i) {
+							if (dim == XDIM) {
+								value -= F[dim][sx_i][i00] * f;
+								value -= F[dim][sx_i][i10] * f;
+								value += F[dim][sx_i][i01] * f;
+								value += F[dim][sx_i][i11] * f;
+							} else if (dim == ZDIM) {
+								value += F[dim][sz_i][i00] * f;
+								value -= F[dim][sz_i][i10] * f;
+								value += F[dim][sz_i][i01] * f;
+								value -= F[dim][sz_i][i11] * f;
+							} else if (dim == YDIM) {
+								value -= F[dim][sx_i][i00] * f;
+								value -= F[dim][sx_i][i10] * f;
+								value += F[dim][sx_i][i01] * f;
+								value += F[dim][sx_i][i11] * f;
+								value += F[dim][sz_i][i00] * f;
+								value -= F[dim][sz_i][i10] * f;
+								value += F[dim][sz_i][i01] * f;
+								value -= F[dim][sz_i][i11] * f;
+							}
+						} else if (field == zz_i) {
+							if (dim == XDIM) {
+								value += F[dim][sx_i][i00] * f;
+								value -= F[dim][sx_i][i10] * f;
+								value += F[dim][sx_i][i01] * f;
+								value -= F[dim][sx_i][i11] * f;
+							} else if (dim == YDIM) {
+								value -= F[dim][sy_i][i00] * f;
+								value += F[dim][sy_i][i10] * f;
+								value -= F[dim][sy_i][i01] * f;
+								value += F[dim][sy_i][i11] * f;
+							} else if (dim == ZDIM) {
+								value -= F[dim][sy_i][i00] * f;
+								value += F[dim][sy_i][i10] * f;
+								value -= F[dim][sy_i][i01] * f;
+								value += F[dim][sy_i][i11] * f;
+								value += F[dim][sx_i][i00] * f;
+								value += F[dim][sx_i][i10] * f;
+								value -= F[dim][sx_i][i01] * f;
+								value -= F[dim][sx_i][i11] * f;
+							}
 						}
 					}
 					value /= real(4);
@@ -444,7 +496,8 @@ std::vector<real> grid::get_prolong(const std::array<integer, NDIM>& lb, const s
 	compute_primitive_slopes(1.0, lb0, ub0, etot_only);
 	compute_conserved_slopes(lb0, ub0, etot_only);
 
-	if (!etot_only) {
+	if (!etot_only && opts.ang_con) {
+// #if !defined(HPX_HAVE_DATAPAR)
 		for (integer i = lb0[XDIM]; i != ub0[XDIM]; ++i) {
 			for (integer j = lb0[YDIM]; j != ub0[YDIM]; ++j) {
 #pragma GCC ivdep
@@ -456,6 +509,8 @@ std::vector<real> grid::get_prolong(const std::array<integer, NDIM>& lb, const s
 				}
 			}
 		}
+// #else
+// #endif
 	}
 
 	for (integer field = 0; field != NF; ++field) {
@@ -472,16 +527,18 @@ std::vector<real> grid::get_prolong(const std::array<integer, NDIM>& lb, const s
 						value += xsgn * dUdx[XDIM][field][iii] * 0.25;
 						value += ysgn * dUdx[YDIM][field][iii] * 0.25;
 						value += zsgn * dUdx[ZDIM][field][iii] * 0.25;
-						if (field == sx_i) {
-							U[zy_i][iii] -= 0.25 * zsgn * value * dx / 8.0;
-							U[zz_i][iii] += 0.25 * ysgn * value * dx / 8.0;
-						} else if (field == sy_i) {
-							U[zx_i][iii] += 0.25 * zsgn * value * dx / 8.0;
-							U[zz_i][iii] -= 0.25 * xsgn * value * dx / 8.0;
-						} else if (field == sz_i) {
-							U[zx_i][iii] -= 0.25 * ysgn * value * dx / 8.0;
-							U[zy_i][iii] += 0.25 * xsgn * value * dx / 8.0;
-						}
+		//				if (opts.ang_con) {
+							if (field == sx_i) {
+								U[zy_i][iii] -= 0.25 * zsgn * value * dx / 8.0;
+								U[zz_i][iii] += 0.25 * ysgn * value * dx / 8.0;
+							} else if (field == sy_i) {
+								U[zx_i][iii] += 0.25 * zsgn * value * dx / 8.0;
+								U[zz_i][iii] -= 0.25 * xsgn * value * dx / 8.0;
+							} else if (field == sz_i) {
+								U[zx_i][iii] -= 0.25 * ysgn * value * dx / 8.0;
+								U[zy_i][iii] += 0.25 * xsgn * value * dx / 8.0;
+							}
+			//			}
 						data.push_back(value);
 					}
 				}
@@ -489,7 +546,7 @@ std::vector<real> grid::get_prolong(const std::array<integer, NDIM>& lb, const s
 		}
 	}
 
-	if (!etot_only) {
+	if (!etot_only && opts.ang_con) {
 		for (integer i = lb0[XDIM]; i != ub0[XDIM]; ++i) {
 			for (integer j = lb0[YDIM]; j != ub0[YDIM]; ++j) {
 #pragma GCC ivdep
@@ -608,15 +665,18 @@ std::pair<std::vector<real>, std::vector<real> > grid::field_range() const {
 HPX_PLAIN_ACTION(grid::set_AB, set_AB_action);
 
 void grid::set_AB(real a, real b) {
+
+    // FIXME: use proper broadcasting...
+
 	if (hpx::get_locality_id() == 0) {
-		std::list<hpx::future<void>> futs;
+        std::vector<hpx::future<void>> futs;
 		auto remotes = hpx::find_remote_localities();
+        futs.reserve(remotes.size());
 		for (auto& l : remotes) {
 			futs.push_back(hpx::async < set_AB_action > (l, a, b));
 		}
-		for (auto& f : futs) {
-			f.get();
-		}
+
+        wait_all_and_propagate_exceptions(futs);
 	}
 	grid::Acons = a;
 	grid::Bcons = b;
@@ -625,15 +685,18 @@ void grid::set_AB(real a, real b) {
 HPX_PLAIN_ACTION(grid::set_omega, set_omega_action);
 
 void grid::set_omega(real omega) {
+
+    // FIXME: use proper broadcasting...
+
 	if (hpx::get_locality_id() == 0) {
-		std::list<hpx::future<void>> futs;
+        std::vector<hpx::future<void>> futs;
 		auto remotes = hpx::find_remote_localities();
+        futs.reserve(remotes.size());
 		for (auto& l : remotes) {
 			futs.push_back(hpx::async < set_omega_action > (l, omega));
 		}
-		for (auto& f : futs) {
-			f.get();
-		}
+
+        wait_all_and_propagate_exceptions(futs);
 	}
 	grid::omega = omega;
 }
@@ -653,12 +716,12 @@ real grid::roche_volume(const std::pair<space_vector, space_vector>& axis, const
 				real y = X[YDIM][iii];
 				real z = X[ZDIM][iii];
 				const real R = std::sqrt(x0 * x0 + y * y);
-				real phi_eff = G[iiig][phi_i] - 0.5 * std::pow(omega * R, 2);
+				real phi_eff = G[iiig][phi_i] - 0.5 * sqr(omega * R);
 				//	real factor = axis.first[0] == l1.first ? 0.5 : 1.0;
 				if ((x0 <= l1.first && !donor) || (x0 >= l1.first && donor)) {
 					if (phi_eff <= l1.second) {
-						const real fx = G[iiig][gx_i] + x0 * std::pow(omega, 2);
-						const real fy = G[iiig][gy_i] + y * std::pow(omega, 2);
+						const real fx = G[iiig][gx_i] + x0 * sqr(omega);
+						const real fy = G[iiig][gy_i] + y * sqr(omega);
 						const real fz = G[iiig][gz_i];
 						real g = x * fx + y * fy + z * fz;
 						if (g <= 0.0) {
@@ -732,8 +795,8 @@ real grid::z_moments(const std::pair<space_vector, space_vector>& axis, const st
 			for (integer k = H_BW; k != H_NX - H_BW; ++k) {
 				const integer iii = hindex(i, j, k);
 				if (is_in_star(axis, l1, frac, iii)) {
-					mom += (std::pow(X[XDIM][iii], 2) + dx * dx / 6.0) * U[rho_i][iii] * dV;
-					mom += (std::pow(X[YDIM][iii], 2) + dx * dx / 6.0) * U[rho_i][iii] * dV;
+					mom += (sqr(X[XDIM][iii]) + sqr(dx) / 6.0) * U[rho_i][iii] * dV;
+					mom += (sqr(X[YDIM][iii]) + sqr(dx) / 6.0) * U[rho_i][iii] * dV;
 				}
 			}
 		}
@@ -761,6 +824,9 @@ std::vector<real> grid::conserved_sums(space_vector& com, space_vector& com_dot,
 					com_dot[1] += U[sy_i][iii] * dV;
 					com_dot[2] += U[sz_i][iii] * dV;
 					for (integer field = 0; field != NF; ++field) {
+	//					if( !opts.ang_con && (field >= zx_i || field <= zz_i)) {
+	//						continue;
+	//					}
 						sum[field] += U[field][iii] * dV;
 					}
 					if (node_server::is_gravity_on()) {
@@ -852,6 +918,14 @@ bool grid::refine_me(integer lev) const {
 		return true;
 	}
 	bool rc = false;
+	std::vector < real > state(NF);
+    std::array<std::vector<real>, NDIM> dud;
+    std::vector<real>& dudx = dud[0];
+    std::vector<real>& dudy = dud[1];
+    std::vector<real>& dudz = dud[2];
+	dudx.resize(NF);
+	dudy.resize(NF);
+	dudz.resize(NF);
 	for (integer i = H_BW - R_BW; i != H_NX - H_BW + R_BW; ++i) {
 		for (integer j = H_BW - R_BW; j != H_NX - H_BW + R_BW; ++j) {
 			for (integer k = H_BW - R_BW; k != H_NX - H_BW + R_BW; ++k) {
@@ -869,17 +943,13 @@ bool grid::refine_me(integer lev) const {
 					continue;
 				}
 				const integer iii = hindex(i, j, k);
-				std::vector < real > state(NF);
-				std::vector < real > dudx(NF);
-				std::vector < real > dudy(NF);
-				std::vector < real > dudz(NF);
 				for (integer i = 0; i != NF; ++i) {
 					state[i] = U[i][iii];
 					dudx[i] = (U[i][iii + H_DNX] - U[i][iii - H_DNX]) / 2.0;
 					dudy[i] = (U[i][iii + H_DNY] - U[i][iii - H_DNY]) / 2.0;
 					dudz[i] = (U[i][iii + H_DNZ] - U[i][iii - H_DNZ]) / 2.0;
 				}
-				if (test(lev, max_level, X[XDIM][iii], X[YDIM][iii], X[ZDIM][iii], state, { { dudx, dudy, dudz } })) {
+				if (test(lev, max_level, X[XDIM][iii], X[YDIM][iii], X[ZDIM][iii], state, dud)) {
 					rc = true;
 					break;
 				}
@@ -950,17 +1020,20 @@ void grid::rho_move(real x) {
  }*/
 
 space_vector grid::center_of_mass() const {
+    auto& M = *M_ptr;
+    auto& mon = *mon_ptr;
 	PROF_BEGIN;
 	space_vector this_com;
 	this_com[0] = this_com[1] = this_com[2] = ZERO;
 	real m = ZERO;
+	auto& com0 = *(com_ptr)[0];
 	for (integer i = 0; i != INX + 0; ++i) {
 		for (integer j = 0; j != INX + 0; ++j) {
 			for (integer k = 0; k != INX + 0; ++k) {
 				const integer iii = gindex(i, j, k);
 				const real this_m = is_leaf ? mon[iii] : M[iii]();
 				for (auto& dim : geo::dimension::full_set()) {
-					this_com[dim] += this_m * com[0][iii][dim];
+					this_com[dim] += this_m * com0[iii][dim];
 				}
 				m += this_m;
 			}
@@ -995,11 +1068,11 @@ void grid::compute_primitives(const std::array<integer, NDIM> lb, const std::arr
 					V[tau_i][iii] = U[tau_i][iii];
 					const real rhoinv = 1.0 / V[rho_i][iii];
 
-					V[egas_i][iii] = (U[egas_i][iii]
-#ifdef WD_EOS
-						- ztwd_energy(U[rho_i][iii])
-#endif
-						) * rhoinv;
+					if (opts.eos == WD) {
+						V[egas_i][iii] = (U[egas_i][iii] - ztwd_energy(U[rho_i][iii])) * rhoinv;
+					} else {
+						V[egas_i][iii] = (U[egas_i][iii]) * rhoinv;
+					}
 					for (integer si = 0; si != NSPECIES; ++si) {
 						V[spc_i + si][iii] = U[spc_i + si][iii] * rhoinv;
 					}
@@ -1010,12 +1083,16 @@ void grid::compute_primitives(const std::array<integer, NDIM> lb, const std::arr
 						auto& v = V[sx_i + d][iii];
 						v = U[sx_i + d][iii] * rhoinv;
 						V[egas_i][iii] -= 0.5 * v * v;
-						V[zx_i + d][iii] = U[zx_i + d][iii] * rhoinv;
+			//			if( opts.ang_con) {
+							V[zx_i + d][iii] = U[zx_i + d][iii] * rhoinv;
+			//			}
 					}
 
 					V[sx_i][iii] += X[YDIM][iii] * omega;
 					V[sy_i][iii] -= X[XDIM][iii] * omega;
-					V[zz_i][iii] -= dx * dx * omega / 6.0;
+//					if( opts.ang_con) {
+//						V[zz_i][iii] -= sqr(dx) * omega / 6.0;
+//					}
 				}
 			}
 		}
@@ -1027,20 +1104,24 @@ void grid::compute_primitives(const std::array<integer, NDIM> lb, const std::arr
 					const integer iii = hindex(i, j, k);
 					V[rho_i][iii] = U[rho_i][iii];
 					const real rhoinv = 1.0 / V[rho_i][iii];
-					V[egas_i][iii] = (U[egas_i][iii]
-#ifdef WD_EOS
-						- ztwd_energy(U[rho_i][iii])
-#endif
-						) * rhoinv;
+					if (opts.eos == WD) {
+						V[egas_i][iii] = (U[egas_i][iii] - ztwd_energy(U[rho_i][iii])) * rhoinv;
+					} else {
+						V[egas_i][iii] = (U[egas_i][iii]) * rhoinv;
+					}
 					for (integer d = 0; d != NDIM; ++d) {
 						auto& v = V[sx_i + d][iii];
 						v = U[sx_i + d][iii] * rhoinv;
 						V[egas_i][iii] -= 0.5 * v * v;
-						V[zx_i + d][iii] = U[zx_i + d][iii] * rhoinv;
+					//	if( opts.ang_con) {
+					//		V[zx_i + d][iii] = U[zx_i + d][iii] * rhoinv;
+					//	}
 					}
 					V[sx_i][iii] += X[YDIM][iii] * omega;
 					V[sy_i][iii] -= X[XDIM][iii] * omega;
-					V[zz_i][iii] -= dx * dx * omega / 6.0;
+				//	if( opts.ang_con ) {
+				//		V[zz_i][iii] -= sqr(dx) * omega / 6.0;
+				//	}
 				}
 			}
 		}
@@ -1083,9 +1164,11 @@ void grid::compute_primitive_slopes(real theta, const std::array<integer, NDIM> 
 						dV_ant[d1][d0] = 0.0;
 					}
 				}
-				dV_ant[XDIM][YDIM] = +6.0 * V[zz_i][iii] / dx;
-				dV_ant[XDIM][ZDIM] = -6.0 * V[zy_i][iii] / dx;
-				dV_ant[YDIM][ZDIM] = +6.0 * V[zx_i][iii] / dx;
+		//		if( opts.ang_con) {
+					dV_ant[XDIM][YDIM] = +6.0 * V[zz_i][iii] / dx;
+					dV_ant[XDIM][ZDIM] = -6.0 * V[zy_i][iii] / dx;
+					dV_ant[YDIM][ZDIM] = +6.0 * V[zx_i][iii] / dx;
+		//		}
 				dV_ant[YDIM][XDIM] = -dV_ant[XDIM][YDIM];
 				dV_ant[ZDIM][XDIM] = -dV_ant[XDIM][ZDIM];
 				dV_ant[ZDIM][YDIM] = -dV_ant[YDIM][ZDIM];
@@ -1115,7 +1198,9 @@ void grid::compute_conserved_slopes(const std::array<integer, NDIM> lb, const st
 					const integer iii = hindex(i,j,k);
 					V[sx_i][iii] -= X[YDIM][iii] * omega;
 					V[sy_i][iii] += X[XDIM][iii] * omega;
-					V[zz_i][iii] += dx * dx * omega / 6.0;
+			//		if( opts.ang_con ) {
+						V[zz_i][iii] += sqr(dx) * omega / 6.0;
+			//		}
 					dVdx[YDIM][sx_i][iii] -= dx * omega;
 					dVdx[XDIM][sy_i][iii] += dx * omega;
 				}
@@ -1140,12 +1225,14 @@ void grid::compute_conserved_slopes(const std::array<integer, NDIM> lb, const st
 						for (integer d1 = 0; d1 != NDIM; ++d1) {
 							dU[sx_i + d1][iii] = V[sx_i + d1][iii] * dV[rho_i][iii] + dV[sx_i + d1][iii] * V[rho_i][iii];
 							dU[egas_i][iii] += V[rho_i][iii] * (V[sx_i + d1][iii] * dV[sx_i + d1][iii]);
-							dU[egas_i][iii] += dV[rho_i][iii] * 0.5 * std::pow(V[sx_i + d1][iii], 2);
-							dU[zx_i + d1][iii] = V[zx_i + d1][iii] * dV[rho_i][iii]; // + dV[zx_i + d1][iii] * V[rho_i][iii];
+							dU[egas_i][iii] += dV[rho_i][iii] * 0.5 * sqr(V[sx_i + d1][iii]);
+				//			if( opts.ang_con ) {
+								dU[zx_i + d1][iii] = V[zx_i + d1][iii] * dV[rho_i][iii];
+				//			}
 						}
-#ifdef WD_EOS
-						V[egas_i][iii] += ztwd_enthalpy(V[rho_i][iii]) * dV[rho_i][iii];
-#endif
+						if( opts.eos == WD) {
+							V[egas_i][iii] += ztwd_enthalpy(V[rho_i][iii]) * dV[rho_i][iii];
+						}
 						dU[tau_i][iii] = dV[tau_i][iii];
 					}
 				}
@@ -1163,7 +1250,7 @@ void grid::compute_conserved_slopes(const std::array<integer, NDIM> lb, const st
 						dU[egas_i][iii] = V[egas_i][iii] * dV[rho_i][iii] + dV[egas_i][iii] * V[rho_i][iii];
 						for (integer d1 = 0; d1 != NDIM; ++d1) {
 							dU[egas_i][iii] += V[rho_i][iii] * (V[sx_i + d1][iii] * dV[sx_i + d1][iii]);
-							dU[egas_i][iii] += dV[rho_i][iii] * 0.5 * std::pow(V[sx_i + d1][iii], 2);
+							dU[egas_i][iii] += dV[rho_i][iii] * 0.5 * sqr(V[sx_i + d1][iii]);
 						}
 					}
 				}
@@ -1257,8 +1344,6 @@ analytic_t grid::compute_analytic(real t) {
 
 void grid::allocate() {
 	PROF_BEGIN;
-//	static std::once_flag flag;
-//	std::call_once(flag, compute_ilist);
 	U_out0 = std::vector < real > (NF, ZERO);
 	U_out = std::vector < real > (NF, ZERO);
 	dphi_dt = std::vector < real > (INX * INX * INX);
@@ -1275,14 +1360,15 @@ void grid::allocate() {
 		}
 	}
 	Ua = U;
-	com.resize(2);
 	L.resize(G_N3);
 	L_c.resize(G_N3);
 	integer nlevel = 0;
-	com[0].resize(G_N3);
-	com[1].resize(G_N3 / 8);
+	com_ptr.resize(2);
 
 	set_coordinates();
+
+    L_mtx.reset(new hpx::lcos::local::spinlock);
+
 	PROF_END;
 }
 
@@ -1318,14 +1404,14 @@ grid::grid(const init_func_type& init_func, real _dx, std::array<real, NDIM> _xm
 	PROF_END;
 }
 
-inline real limit_range(real a, real b, real& c) {
+inline void limit_range(real a, real b, real& c) {
 	const real max = std::max(a, b);
 	const real min = std::min(a, b);
 	c = std::min(max, std::max(min, c));
 }
 ;
 
-inline real limit_range_all(real am, real ap, real& bl, real& br) {
+inline void limit_range_all(real am, real ap, real& bl, real& br) {
 	real avg = (br + bl) / 2.0;
 	limit_range(am, ap, avg);
 	limit_range(am, avg, bl);
@@ -1333,14 +1419,16 @@ inline real limit_range_all(real am, real ap, real& bl, real& br) {
 }
 ;
 
-inline real limit_slope(real& ql, real q0, real& qr) {
+inline void limit_slope(real& ql, real q0, real& qr) {
 	const real tmp1 = qr - ql;
 	const real tmp2 = qr + ql;
-	if ((qr - q0) * (q0 - ql) <= 0.0) {
+//	if ((qr - q0) * (q0 - ql) <= 0.0) {
+	//    if (qr < q0 || q0 < ql) {
+    if (bool(qr < q0) != bool(q0 < ql)) {
 		qr = ql = q0;
-	} else if (tmp1 * (q0 - 0.5 * tmp2) > (1.0 / 6.0) * tmp1 * tmp1) {
+	} else if (tmp1 * (q0 - 0.5 * tmp2) > sqr(tmp1) / 6.0) {
 		ql = 3.0 * q0 - 2.0 * qr;
-	} else if (-(1.0 / 6.0) * tmp1 * tmp1 > tmp1 * (q0 - 0.5 * tmp2)) {
+	} else if (-(sqr(tmp1) / 6.0) > tmp1 * (q0 - 0.5 * tmp2)) {
 		qr = 3.0 * q0 - 2.0 * ql;
 	}
 }
@@ -1368,6 +1456,7 @@ void grid::reconstruct() {
 		const real theta_x = (field == sy_i || field == sz_i) ? 1.0 : 2.0;
 		const real theta_y = (field == sx_i || field == sz_i) ? 1.0 : 2.0;
 		const real theta_z = (field == sx_i || field == sy_i) ? 1.0 : 2.0;
+        std::vector<real> const& Vfield = V[field];
 #pragma GCC ivdep
 		for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
 			if (field == 1) {
@@ -1380,122 +1469,155 @@ void grid::reconstruct() {
 				// printf("%e %e %e\n", V[rho_i][iii + H_DNY], V[rho_i][iii], V[rho_i][iii - H_DNY]);
 				//	printf("%e %e %e\n", V[rho_i][iii + H_DNZ], V[rho_i][iii], V[rho_i][iii - H_DNZ]);
 			}
-			slpx[field][iii] = minmod_theta(V[field][iii + H_DNX] - V[field][iii], V[field][iii] - V[field][iii - H_DNX], theta_x);
-			slpy[field][iii] = minmod_theta(V[field][iii + H_DNY] - V[field][iii], V[field][iii] - V[field][iii - H_DNY], theta_y);
-			slpz[field][iii] = minmod_theta(V[field][iii + H_DNZ] - V[field][iii], V[field][iii] - V[field][iii - H_DNZ], theta_z);
+			slpx[field][iii] = minmod_theta(Vfield[iii + H_DNX] - Vfield[iii], Vfield[iii] - Vfield[iii - H_DNX], theta_x);
+			slpy[field][iii] = minmod_theta(Vfield[iii + H_DNY] - Vfield[iii], Vfield[iii] - Vfield[iii - H_DNY], theta_y);
+			slpz[field][iii] = minmod_theta(Vfield[iii + H_DNZ] - Vfield[iii], Vfield[iii] - Vfield[iii - H_DNZ], theta_z);
 		}
 	}
 
 	if (opts.ang_con) {
-#pragma GCC ivdep
+//#pragma GCC ivdep
+        auto average = [](real& s1, real& s2) { s1 = s2 = 0.5 * (s1 + s2); };
+        auto step1 = [&](real& lhs, real const& rhs) { lhs += 6.0 * rhs / dx; };
+        auto step2 = [&](real& lhs, real const& rhs) { lhs -= 6.0 * rhs / dx; };
+        auto minmod_step =
+            [](real& lhs, real const& r1, real const& r2, real const& r3)
+            {
+                lhs = minmod(lhs, 2.0 * minmod(r1 - r2, r2 - r3));
+            };
+
 		for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
+			average(slpx[sy_i][iii], slpy[sx_i][iii]);
+			average(slpx[sz_i][iii], slpz[sx_i][iii]);
+			average(slpy[sz_i][iii], slpz[sy_i][iii]);
 
-			slpx[sy_i][iii] = slpy[sx_i][iii] = 0.5 * (slpx[sy_i][iii] + slpy[sx_i][iii]);
-			slpx[sz_i][iii] = slpz[sx_i][iii] = 0.5 * (slpx[sz_i][iii] + slpz[sx_i][iii]);
-			slpy[sz_i][iii] = slpz[sy_i][iii] = 0.5 * (slpy[sz_i][iii] + slpz[sy_i][iii]);
+			step1(slpx[sy_i][iii], V[zz_i][iii]);
+			step1(slpy[sz_i][iii], V[zx_i][iii]);
+			step1(slpz[sx_i][iii], V[zy_i][iii]);
 
-			slpy[sz_i][iii] += 6.0 * V[zx_i][iii] / dx;
-			slpz[sy_i][iii] -= 6.0 * V[zx_i][iii] / dx;
-			slpx[sz_i][iii] -= 6.0 * V[zy_i][iii] / dx;
-			slpz[sx_i][iii] += 6.0 * V[zy_i][iii] / dx;
-			slpx[sy_i][iii] += 6.0 * V[zz_i][iii] / dx;
-			slpy[sx_i][iii] -= 6.0 * V[zz_i][iii] / dx;
+			step2(slpy[sx_i][iii], V[zz_i][iii]);
+			step2(slpz[sy_i][iii], V[zx_i][iii]);
+			step2(slpx[sz_i][iii], V[zy_i][iii]);
 
-			slpx[sy_i][iii] = minmod(slpx[sy_i][iii], 2.0 * minmod(V[sy_i][iii + H_DNX] - V[sy_i][iii], V[sy_i][iii] - V[sy_i][iii - H_DNX]));
-			slpx[sz_i][iii] = minmod(slpx[sz_i][iii], 2.0 * minmod(V[sz_i][iii + H_DNX] - V[sz_i][iii], V[sz_i][iii] - V[sz_i][iii - H_DNX]));
-			slpy[sx_i][iii] = minmod(slpy[sx_i][iii], 2.0 * minmod(V[sx_i][iii + H_DNY] - V[sx_i][iii], V[sx_i][iii] - V[sx_i][iii - H_DNY]));
-			slpy[sz_i][iii] = minmod(slpy[sz_i][iii], 2.0 * minmod(V[sz_i][iii + H_DNY] - V[sz_i][iii], V[sz_i][iii] - V[sz_i][iii - H_DNY]));
-			slpz[sx_i][iii] = minmod(slpz[sx_i][iii], 2.0 * minmod(V[sx_i][iii + H_DNZ] - V[sx_i][iii], V[sx_i][iii] - V[sx_i][iii - H_DNZ]));
-			slpz[sy_i][iii] = minmod(slpz[sy_i][iii], 2.0 * minmod(V[sy_i][iii + H_DNZ] - V[sy_i][iii], V[sy_i][iii] - V[sy_i][iii - H_DNZ]));
+			minmod_step(slpx[sy_i][iii], V[sy_i][iii + H_DNX], V[sy_i][iii], V[sy_i][iii - H_DNX]);
+			minmod_step(slpx[sz_i][iii], V[sz_i][iii + H_DNX], V[sz_i][iii], V[sz_i][iii - H_DNX]);
+			minmod_step(slpy[sx_i][iii], V[sx_i][iii + H_DNY], V[sx_i][iii], V[sx_i][iii - H_DNY]);
+			minmod_step(slpy[sz_i][iii], V[sz_i][iii + H_DNY], V[sz_i][iii], V[sz_i][iii - H_DNY]);
+			minmod_step(slpz[sx_i][iii], V[sx_i][iii + H_DNZ], V[sx_i][iii], V[sx_i][iii - H_DNZ]);
+			minmod_step(slpz[sy_i][iii], V[sy_i][iii + H_DNZ], V[sy_i][iii], V[sy_i][iii - H_DNZ]);
+
 			const real zx_lim = +(slpy[sz_i][iii] - slpz[sy_i][iii]) / 12.0;
 			const real zy_lim = -(slpx[sz_i][iii] - slpz[sx_i][iii]) / 12.0;
 			const real zz_lim = +(slpx[sy_i][iii] - slpy[sx_i][iii]) / 12.0;
+
+            const real Vzxi = V[zx_i][iii] - zx_lim * dx;
+            const real Vzyi = V[zy_i][iii] - zy_lim * dx;
+            const real Vzzi = V[zz_i][iii] - zz_lim * dx;
+
 			for (int face = 0; face != NFACE; ++face) {
-				Uf[face][zx_i][iii] = V[zx_i][iii] - zx_lim * dx;
-				Uf[face][zy_i][iii] = V[zy_i][iii] - zy_lim * dx;
-				Uf[face][zz_i][iii] = V[zz_i][iii] - zz_lim * dx;
+				Uf[face][zx_i][iii] = Vzxi;
+				Uf[face][zy_i][iii] = Vzyi;
+				Uf[face][zz_i][iii] = Vzzi;
 			}
 		}
 	} else {
 #pragma GCC ivdep
 		for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
+            const real Vzxi = V[zx_i][iii];
+            const real Vzyi = V[zy_i][iii];
+            const real Vzzi = V[zz_i][iii];
+
 			for (int face = 0; face != NFACE; ++face) {
-				Uf[face][zx_i][iii] = V[zx_i][iii];
-				Uf[face][zy_i][iii] = V[zy_i][iii];
-				Uf[face][zz_i][iii] = V[zz_i][iii];
+				Uf[face][zx_i][iii] = Vzxi;
+				Uf[face][zy_i][iii] = Vzyi;
+				Uf[face][zz_i][iii] = Vzzi;
 			}
 		}
 	}
 	for (integer field = 0; field != NF; ++field) {
+        std::vector<real>& Vfield = V[field];
+
+        std::vector<real>& UfFXPfield = Uf[FXP][field];
+        std::vector<real>& UfFXMfield = Uf[FXM][field];
+        std::vector<real> const& slpxfield = slpx[field];
+
 		if (field >= zx_i && field <= zz_i) {
 			continue;
 		}
 		if (!(field == sy_i || field == sz_i)) {
 #pragma GCC ivdep
 			for (integer iii = 0; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FXP][field][iii] = Uf[FXM][field][iii + H_DNX] = (V[field][iii + H_DNX] + u0) * HALF;
+				const real& u0 = Vfield[iii];
+				UfFXPfield[iii] = UfFXMfield[iii + H_DNX] = (Vfield[iii + H_DNX] + u0) * HALF;
 			}
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				const real& sx = slpx[field][iii];
-				Uf[FXP][field][iii] += (-(slpx[field][iii + H_DNX] - sx) / 3.0) * HALF;
-				Uf[FXM][field][iii] += (+(slpx[field][iii - H_DNX] - sx) / 3.0) * HALF;
-				limit_slope(Uf[FXM][field][iii], u0, Uf[FXP][field][iii]);
+				const real& u0 = Vfield[iii];
+				const real& sx = slpxfield[iii];
+				UfFXPfield[iii] += (-(slpxfield[iii + H_DNX] - sx) / 3.0) * HALF;
+				UfFXMfield[iii] += ( (slpxfield[iii - H_DNX] - sx) / 3.0) * HALF;
+				limit_slope(UfFXMfield[iii], u0, UfFXPfield[iii]);
 			}
 		} else {
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FXP][field][iii] = u0 + 0.5 * slpx[field][iii];
-				Uf[FXM][field][iii] = u0 - 0.5 * slpx[field][iii];
+				const real& u0 = Vfield[iii];
+				UfFXPfield[iii] = u0 + 0.5 * slpxfield[iii];
+				UfFXMfield[iii] = u0 - 0.5 * slpxfield[iii];
 			}
 		}
+
+        std::vector<real>& UfFYPfield = Uf[FYP][field];
+        std::vector<real>& UfFYMfield = Uf[FYM][field];
+        std::vector<real> const& slpyfield = slpy[field];
 
 		if (!(field == sx_i || field == sz_i)) {
 #pragma GCC ivdep
 			for (integer iii = 0; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FYP][field][iii] = Uf[FYM][field][iii + H_DNY] = (V[field][iii + H_DNY] + u0) * HALF;
+				const real& u0 = Vfield[iii];
+				UfFYPfield[iii] = UfFYMfield[iii + H_DNY] = (Vfield[iii + H_DNY] + u0) * HALF;
 			}
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				const real& sy = slpy[field][iii];
-				Uf[FYP][field][iii] += (-(slpy[field][iii + H_DNY] - sy) / 3.0) * HALF;
-				Uf[FYM][field][iii] += (+(slpy[field][iii - H_DNY] - sy) / 3.0) * HALF;
-				limit_slope(Uf[FYM][field][iii], u0, Uf[FYP][field][iii]);
+				const real& u0 = Vfield[iii];
+				const real& sy = slpyfield[iii];
+				UfFYPfield[iii] += (-(slpyfield[iii + H_DNY] - sy) / 3.0) * HALF;
+				UfFYMfield[iii] += ( (slpyfield[iii - H_DNY] - sy) / 3.0) * HALF;
+				limit_slope(UfFYMfield[iii], u0, UfFYPfield[iii]);
 			}
 		} else {
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FYP][field][iii] = u0 + 0.5 * slpy[field][iii];
-				Uf[FYM][field][iii] = u0 - 0.5 * slpy[field][iii];
+				const real& u0 = Vfield[iii];
+				UfFYPfield[iii] = u0 + 0.5 * slpyfield[iii];
+				UfFYMfield[iii] = u0 - 0.5 * slpyfield[iii];
 			}
 		}
+
+        std::vector<real>& UfFZPfield = Uf[FZP][field];
+        std::vector<real>& UfFZMfield = Uf[FZM][field];
+        std::vector<real> const& slpzfield = slpz[field];
 
 		if (!(field == sx_i || field == sy_i)) {
 #pragma GCC ivdep
 			for (integer iii = 0; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FZP][field][iii] = Uf[FZM][field][iii + H_DNZ] = (V[field][iii + H_DNZ] + u0) * HALF;
+				const real& u0 = Vfield[iii];
+				UfFZPfield[iii] = UfFZMfield[iii + H_DNZ] = (Vfield[iii + H_DNZ] + u0) * HALF;
 			}
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				const real& sz = slpz[field][iii];
-				Uf[FZP][field][iii] += (-(slpz[field][iii + H_DNZ] - sz) / 3.0) * HALF;
-				Uf[FZM][field][iii] += (+(slpz[field][iii - H_DNZ] - sz) / 3.0) * HALF;
-				limit_slope(Uf[FZM][field][iii], u0, Uf[FZP][field][iii]);
+				const real& u0 = Vfield[iii];
+				const real& sz = slpzfield[iii];
+				UfFZPfield[iii] += (-(slpzfield[iii + H_DNZ] - sz) / 3.0) * HALF;
+				UfFZMfield[iii] += ( (slpzfield[iii - H_DNZ] - sz) / 3.0) * HALF;
+				limit_slope(UfFZMfield[iii], u0, UfFZPfield[iii]);
 			}
 		} else {
 #pragma GCC ivdep
 			for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-				const real& u0 = V[field][iii];
-				Uf[FZP][field][iii] = u0 + 0.5 * slpz[field][iii];
-				Uf[FZM][field][iii] = u0 - 0.5 * slpz[field][iii];
+				const real& u0 = Vfield[iii];
+				UfFZPfield[iii] = u0 + 0.5 * slpzfield[iii];
+				UfFZMfield[iii] = u0 - 0.5 * slpzfield[iii];
 			}
 		}
 	}
@@ -1504,37 +1626,48 @@ void grid::reconstruct() {
 #pragma GCC ivdep
 		for (integer face = 0; face != NFACE; ++face) {
 			real w = 0.0;
+            std::vector<std::vector<real> >& Ufface = Uf[face];
 			for (integer si = 0; si != NSPECIES; ++si) {
-				w += Uf[face][spc_i + si][iii];
+				w += Ufface[spc_i + si][iii];
 			}
 			if (w > ZERO) {
 				for (integer si = 0; si != NSPECIES; ++si) {
-					Uf[face][spc_i + si][iii] /= w;
+					Ufface[spc_i + si][iii] /= w;
 				}
 			}
 		}
 	}
 
 	if (node_server::is_gravity_on()) {
-#pragma GCC ivdep
+//#pragma GCC ivdep
+        std::vector<real>& UfFXMpot_i = Uf[FXM][pot_i];
+        std::vector<real>& UfFYMpot_i = Uf[FYM][pot_i];
+        std::vector<real>& UfFZMpot_i = Uf[FZM][pot_i];
+
+        std::vector<real>& UfFXPpot_i = Uf[FXP][pot_i];
+        std::vector<real>& UfFYPpot_i = Uf[FYP][pot_i];
+        std::vector<real>& UfFZPpot_i = Uf[FZP][pot_i];
+
 		for (integer iii = H_NX * H_NX; iii != H_N3 - H_NX * H_NX; ++iii) {
-			const real phi_x = HALF * (Uf[FXM][pot_i][iii] + Uf[FXP][pot_i][iii - H_DNX]);
-			const real phi_y = HALF * (Uf[FYM][pot_i][iii] + Uf[FYP][pot_i][iii - H_DNY]);
-			const real phi_z = HALF * (Uf[FZM][pot_i][iii] + Uf[FZP][pot_i][iii - H_DNZ]);
-			Uf[FXM][pot_i][iii] = phi_x;
-			Uf[FYM][pot_i][iii] = phi_y;
-			Uf[FZM][pot_i][iii] = phi_z;
-			Uf[FXP][pot_i][iii - H_DNX] = phi_x;
-			Uf[FYP][pot_i][iii - H_DNY] = phi_y;
-			Uf[FZP][pot_i][iii - H_DNZ] = phi_z;
+			const real phi_x = HALF * (UfFXMpot_i[iii] + UfFXPpot_i[iii - H_DNX]);
+			const real phi_y = HALF * (UfFYMpot_i[iii] + UfFYPpot_i[iii - H_DNY]);
+			const real phi_z = HALF * (UfFZMpot_i[iii] + UfFZPpot_i[iii - H_DNZ]);
+			UfFXMpot_i[iii] = phi_x;
+			UfFYMpot_i[iii] = phi_y;
+			UfFZMpot_i[iii] = phi_z;
+			UfFXPpot_i[iii - H_DNX] = phi_x;
+			UfFYPpot_i[iii - H_DNY] = phi_y;
+			UfFZPpot_i[iii - H_DNZ] = phi_z;
 		}
 	}
 	for (integer field = 0; field != NF; ++field) {
 		if (field != rho_i && field != tau_i) {
 #pragma GCC ivdep
-			for (integer iii = 0; iii != H_N3; ++iii) {
-				for (integer face = 0; face != NFACE; ++face) {
-					Uf[face][field][iii] *= Uf[face][rho_i][iii];
+			for (integer face = 0; face != NFACE; ++face) {
+                std::vector<real>& Uffacefield = Uf[face][field];
+                std::vector<real> const& Uffacerho_i = Uf[face][rho_i];
+			    for (integer iii = 0; iii != H_N3; ++iii) {
+					Uffacefield[iii] *= Uffacerho_i[iii];
 				}
 			}
 		}
@@ -1546,6 +1679,9 @@ void grid::reconstruct() {
 			for (integer k = H_BW - 1; k != H_NX - H_BW + 1; ++k) {
 				const integer iii = hindex(i, j, k);
 				for (integer face = 0; face != NFACE; ++face) {
+                    std::vector<std::vector<real> >& Ufface = Uf[face];
+                    real const Uffacerho_iii = Ufface[rho_i][iii];
+
 					real x0 = ZERO;
 					real y0 = ZERO;
 					if (face == FXP) {
@@ -1557,15 +1693,16 @@ void grid::reconstruct() {
 					} else if (face == FYM) {
 						y0 = -HALF * dx;
 					}
-					Uf[face][sx_i][iii] -= omega * (X[YDIM][iii] + y0) * Uf[face][rho_i][iii];
-					Uf[face][sy_i][iii] += omega * (X[XDIM][iii] + x0) * Uf[face][rho_i][iii];
-					Uf[face][zz_i][iii] += dx * dx * omega * Uf[face][rho_i][iii] / 6.0;
-					Uf[face][egas_i][iii] += HALF * Uf[face][sx_i][iii] * Uf[face][sx_i][iii] / Uf[face][rho_i][iii];
-					Uf[face][egas_i][iii] += HALF * Uf[face][sy_i][iii] * Uf[face][sy_i][iii] / Uf[face][rho_i][iii];
-					Uf[face][egas_i][iii] += HALF * Uf[face][sz_i][iii] * Uf[face][sz_i][iii] / Uf[face][rho_i][iii];
-#ifdef WD_EOS
-					Uf[face][egas_i][iii] += ztwd_energy(Uf[face][rho_i][iii]);
-#endif
+
+					Ufface[sx_i][iii] -= omega * (X[YDIM][iii] + y0) * Uffacerho_iii;
+					Ufface[sy_i][iii] += omega * (X[XDIM][iii] + x0) * Uffacerho_iii;
+					Ufface[zz_i][iii] += sqr(dx) * omega * Uffacerho_iii / 6.0;
+					Ufface[egas_i][iii] += HALF * sqr(Ufface[sx_i][iii]) / Uffacerho_iii;
+					Ufface[egas_i][iii] += HALF * sqr(Ufface[sy_i][iii]) / Uffacerho_iii;
+					Ufface[egas_i][iii] += HALF * sqr(Ufface[sz_i][iii]) / Uffacerho_iii;
+					if( opts.eos == WD ) {
+						Ufface[egas_i][iii] += ztwd_energy(Uffacerho_iii);
+					}
 				}
 			}
 		}
@@ -1676,9 +1813,11 @@ void grid::set_physical_boundaries(const geo::face& face, real t) {
 					U[egas_i][iii] += s.rho * s.v * s.v / 2.0;
 					U[spc_ac_i][iii] = s.rho;
 					integer k0 = side == geo::MINUS ? H_BW : H_NX - H_BW - 1;
-					U[zx_i][iii] = 0.0;
-					U[zy_i][iii] = 0.0;
-					U[zz_i][iii] = 0.0;
+					if( opts.ang_con ) {
+						U[zx_i][iii] = 0.0;
+						U[zy_i][iii] = 0.0;
+						U[zz_i][iii] = 0.0;
+					}
 				}
 			}
 		}
@@ -1757,9 +1896,11 @@ void grid::compute_sources(real t) {
 					src[field][iii0] = ZERO;
 				}
 				const real rho = U[rho_i][iii];
-				src[zx_i][iii0] = (-(F[YDIM][sz_i][iiif + F_DNY] + F[YDIM][sz_i][iiif]) + (F[ZDIM][sy_i][iiif + F_DNZ] + F[ZDIM][sy_i][iiif])) * HALF;
-				src[zy_i][iii0] = (+(F[XDIM][sz_i][iiif + F_DNX] + F[XDIM][sz_i][iiif]) - (F[ZDIM][sx_i][iiif + F_DNZ] + F[ZDIM][sx_i][iiif])) * HALF;
-				src[zz_i][iii0] = (-(F[XDIM][sy_i][iiif + F_DNX] + F[XDIM][sy_i][iiif]) + (F[YDIM][sx_i][iiif + F_DNY] + F[YDIM][sx_i][iiif])) * HALF;
+		//		if( opts.ang_con) {
+					src[zx_i][iii0] = (-(F[YDIM][sz_i][iiif + F_DNY] + F[YDIM][sz_i][iiif]) + (F[ZDIM][sy_i][iiif + F_DNZ] + F[ZDIM][sy_i][iiif])) * HALF;
+					src[zy_i][iii0] = (+(F[XDIM][sz_i][iiif + F_DNX] + F[XDIM][sz_i][iiif]) - (F[ZDIM][sx_i][iiif + F_DNZ] + F[ZDIM][sx_i][iiif])) * HALF;
+					src[zz_i][iii0] = (-(F[XDIM][sy_i][iiif + F_DNX] + F[XDIM][sy_i][iiif]) + (F[YDIM][sx_i][iiif + F_DNY] + F[YDIM][sx_i][iiif])) * HALF;
+		//		}
 				if (node_server::is_gravity_on()) {
 					src[sx_i][iii0] += rho * G[iiig][gx_i];
 					src[sy_i][iii0] += rho * G[iiig][gy_i];
@@ -1879,9 +2020,11 @@ void grid::next_u(integer rk, real t, real dt) {
 				const integer iii0 = h0index(i - H_BW, j - H_BW, k - H_BW);
 				const integer iii = hindex(i, j, k);
 				dUdt[egas_i][iii0] += (dphi_dt[iii0] * U[rho_i][iii]) * HALF;
-				dUdt[zx_i][iii0] -= omega * X[ZDIM][iii] * U[sx_i][iii];
-				dUdt[zy_i][iii0] -= omega * X[ZDIM][iii] * U[sy_i][iii];
-				dUdt[zz_i][iii0] += omega * (X[XDIM][iii] * U[sx_i][iii] + X[YDIM][iii] * U[sy_i][iii]);
+		//		if( opts.ang_con ) {
+					dUdt[zx_i][iii0] -= omega * X[ZDIM][iii] * U[sx_i][iii];
+					dUdt[zy_i][iii0] -= omega * X[ZDIM][iii] * U[sy_i][iii];
+					dUdt[zz_i][iii0] += omega * (X[XDIM][iii] * U[sx_i][iii] + X[YDIM][iii] * U[sy_i][iii]);
+	//			}
 			}
 		}
 	}
@@ -1910,7 +2053,7 @@ void grid::next_u(integer rk, real t, real dt) {
 	for (integer i = H_BW; i != H_NX - H_BW; ++i) {
 #pragma GCC ivdep
 		for (integer j = H_BW; j != H_NX - H_BW; ++j) {
-			const real dx2 = dx * dx;
+			const real dx2 = sqr(dx);
 			const integer iii_p0 = findex(INX, i - H_BW, j - H_BW);
 			const integer jjj_p0 = findex(j - H_BW, INX, i - H_BW);
 			const integer kkk_p0 = findex(i - H_BW, j - H_BW, INX);
@@ -1925,7 +2068,6 @@ void grid::next_u(integer rk, real t, real dt) {
 			const integer kkk_m = H_DNZ * (H_BW) + H_DNX * i + H_DNY * j;
 			std::vector < real > du(NF);
 			for (integer field = 0; field != NF; ++field) {
-				//	if (field < zx_i || field > zz_i) {
 				du[field] = ZERO;
 				if (X[XDIM][iii_p] + pivot[XDIM] > scaling_factor) {
 					du[field] += (F[XDIM][field][iii_p0]) * dx2;
@@ -1945,9 +2087,7 @@ void grid::next_u(integer rk, real t, real dt) {
 				if (X[ZDIM][kkk_m] + pivot[ZDIM] < -scaling_factor + dx) {
 					du[field] += (-F[ZDIM][field][kkk_m0]) * dx2;
 				}
-				//			}
 			}
-
 			if (X[XDIM][iii_p] + pivot[XDIM] > scaling_factor) {
 				const real xp = X[XDIM][iii_p] - HALF * dx;
 				du[zx_i] += (X[YDIM][iii_p] * F[XDIM][sz_i][iii_p0]) * dx2;
@@ -2019,9 +2159,9 @@ void grid::next_u(integer rk, real t, real dt) {
 #pragma GCC ivdep
 			for (integer k = H_BW; k != H_NX - H_BW; ++k) {
 				const integer iii = hindex(i, j, k);
-				if (opts.problem == SOD) {
-					U[zx_i][iii] = U[zy_i][iii] = U[zz_i][iii] = 0.0;
-				}
+//				if (opts.problem == SOD && opts.ang_con) {
+//					U[zx_i][iii] = U[zy_i][iii] = U[zz_i][iii] = 0.0;
+//				}
 				U[rho_i][iii] = ZERO;
 				for (integer si = 0; si != NSPECIES; ++si) {
 					U[rho_i][iii] += U[spc_i + si][iii];
@@ -2044,7 +2184,7 @@ void grid::next_u(integer rk, real t, real dt) {
 
 void grid::dual_energy_update() {
 	PROF_BEGIN;
-	bool in_bnd;
+//	bool in_bnd;
 	for (integer i = H_BW; i != H_NX - H_BW; ++i) {
 		for (integer j = H_BW; j != H_NX - H_BW; ++j) {
 #pragma GCC ivdep
@@ -2054,11 +2194,12 @@ void grid::dual_energy_update() {
 				ek += HALF * pow(U[sx_i][iii], 2) / U[rho_i][iii];
 				ek += HALF * pow(U[sy_i][iii], 2) / U[rho_i][iii];
 				ek += HALF * pow(U[sz_i][iii], 2) / U[rho_i][iii];
-				real ei = U[egas_i][iii] - ek
-#ifdef WD_EOS
-					- ztwd_energy(U[rho_i][iii])
-#endif
-					;
+				real ei;
+				if (opts.eos == WD) {
+					ei = U[egas_i][iii] - ek - ztwd_energy(U[rho_i][iii]);
+				} else {
+					ei = U[egas_i][iii] - ek;
+				}
 				real et = U[egas_i][iii];
 				et = std::max(et, U[egas_i][iii + H_DNX]);
 				et = std::max(et, U[egas_i][iii - H_DNX]);

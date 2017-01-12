@@ -5,6 +5,7 @@
  *      Author: dmarce1
  */
 
+#include "defs.hpp"
 #include "options.hpp"
 #include <math.h>
 #include "grid.hpp"
@@ -17,9 +18,12 @@
 #define XSCALE_OPT "-Xscale"
 #define OMEGA_OPT "-Omega"
 #define ODT_OPT "-Odt"
+#define DISABLEOUTPUT_OPT "-Disableoutput"
 #define STOPTIME_OPT "-Stoptime"
+#define STOPSTEP_OPT "-Stopstep"
 #define BENCH_OPT "-Bench"
 #define THETA_OPT "-Theta"
+#define EOS_OPT "-Eos"
 
 #define MAX_LEVEL_OPT "-Max_level"
 
@@ -53,6 +57,7 @@ void options::show_help() {
 
 bool options::process_options(int argc, char* argv[]) {
 	bool rc;
+	eos = IDEAL;
 	rc = true;
 	theta = 0.35;
 	max_level = 5;
@@ -63,10 +68,12 @@ bool options::process_options(int argc, char* argv[]) {
 	omega = -1.0;
 	exe_name = std::string(argv[0]);
 	contact_fill = 0.0;
-	output_dt = 1.0e-2;
+	output_dt = -1;
 	bench = false;
 	ang_con = true;
 	stop_time = std::numeric_limits < real > ::max();
+    stop_step = std::numeric_limits < integer >::max();
+    disable_output = false;
 
 	for (integer i = 1; i < argc; ++i) {
 		if (cmp(argv[i], HELP_OPT)) {
@@ -94,6 +101,16 @@ bool options::process_options(int argc, char* argv[]) {
 			}
 		} else if (cmp(argv[i], BENCH_OPT)) {
 			bench = true;
+		} else if (cmp(argv[i], EOS_OPT)) {
+			const char* str = argv[i] + strlen(EOS_OPT) + 1;
+			if( strncmp(str, "ideal", 3) == 0 ) {
+				eos = IDEAL;
+			} else if( strncmp( str, "wd", 2) == 0 ) {
+				eos = WD;
+			} else {
+				printf( "Unknown EOS specified - choose ideal or wd.\n");
+				abort();
+			}
 		} else if (cmp(argv[i], THETA_OPT)) {
 			theta = atof(argv[i] + strlen(THETA_OPT) + 1);
 		} else if (cmp(argv[i], RESTART_OPT)) {
@@ -103,21 +120,31 @@ bool options::process_options(int argc, char* argv[]) {
 			output_filename = std::string(argv[i] + strlen(OUTPUT_OPT) + 1);
 			output_only = true;
 		} else if (cmp(argv[i], ANGCON_OPT)) {
-			ang_con = atof(argv[i] + strlen(ANGCON_OPT) + 1);
+			ang_con = atoi(argv[i] + strlen(ANGCON_OPT) + 1) != 0;
 		} else if (cmp(argv[i], MAX_LEVEL_OPT)) {
 			max_level = atoi(argv[i] + strlen(MAX_LEVEL_OPT) + 1);
 		} else if (cmp(argv[i], XSCALE_OPT)) {
 			xscale = atof(argv[i] + strlen(XSCALE_OPT) + 1);
 		} else if (cmp(argv[i], OMEGA_OPT)) {
 			omega = atof(argv[i] + strlen(OMEGA_OPT) + 1);
-			output_dt = (2.0 * M_PI / omega) / 100.0;
 		} else if (cmp(argv[i], ODT_OPT)) {
 			output_dt = atof(argv[i] + strlen(ODT_OPT) + 1);
+        } else if (cmp(argv[i], DISABLEOUTPUT_OPT)) {
+            disable_output = true;
 		} else if (cmp(argv[i], STOPTIME_OPT)) {
 			stop_time = atof(argv[i] + strlen(STOPTIME_OPT) + 1);
+		} else if (cmp(argv[i], STOPSTEP_OPT)) {
+            stop_step = atoi(argv[i] + strlen(STOPSTEP_OPT) + 1);
 		} else {
 			printf("Unknown option - %s\n", argv[i]);
 			abort();
+		}
+	}
+	if( output_dt < 0 ) {
+		if( omega > 0.0 ) {
+			output_dt = (2.0 * M_PI / omega) / 100.0;
+		} else {
+	 		output_dt = 1.0e-2;
 		}
 	}
 	if (!rc) {
@@ -125,5 +152,6 @@ bool options::process_options(int argc, char* argv[]) {
 	}
 	theta = std::max(1.0 / 3.0, theta);
 	theta = std::min(1.0 / 2.0, theta);
+	grid::set_omega(omega);
 	return rc;
 }

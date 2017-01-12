@@ -9,6 +9,7 @@
 #define GEOMETRY_HPP_
 
 #include "defs.hpp"
+#include <cstdlib>
 #include <cassert>
 
 namespace geo {
@@ -180,7 +181,7 @@ public:
 		return (i >> dim) & 1;
 	}
 	octant neighbor(const direction& dir) {
-		integer ci = ZERO;
+		integer ci = static_cast<integer>(ZERO);
 		for (auto& d : dimension::full_set()) {
 			const integer bit = integer(1) << integer(d);
 			if (dir[d] == 0) {

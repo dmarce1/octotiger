@@ -1,15 +1,24 @@
-#include <fenv.h>
 #include "defs.hpp"
 
 #include "node_server.hpp"
 #include "node_client.hpp"
 #include "future.hpp"
-#include <chrono>
-#include <unistd.h>
-#include <hpx/hpx_init.hpp>
 #include "problem.hpp"
-
 #include "options.hpp"
+
+#include <chrono>
+#include <utility>
+
+#include <fenv.h>
+#if !defined(_MSC_VER)
+#include <unistd.h>
+#else
+#include <float.h>
+#endif
+
+#include <hpx/hpx_init.hpp>
+#include <hpx/include/lcos.hpp>
+
 options opts;
 
 bool gravity_on = true;
@@ -20,11 +29,13 @@ void compute_ilist();
 
 void initialize(options _opts) {
 	opts = _opts;
-//#ifndef NDEBUG
+#if !defined(_MSC_VER) && !defined(__APPLE__)
 	feenableexcept (FE_DIVBYZERO);
 	feenableexcept (FE_INVALID);
 	feenableexcept (FE_OVERFLOW);
-//#endif
+// #else
+//     _controlfp(_EM_INEXACT | _EM_DENORMAL | _EM_INVALID, _MCW_EM);
+#endif
 	grid::set_scaling_factor(opts.xscale);
 	grid::set_max_level(opts.max_level);
 
@@ -104,22 +115,21 @@ void node_server::set_pivot() {
 
 int hpx_main(int argc, char* argv[]) {
 	printf("Running\n");
-	auto test_fut = hpx::async([]() {
+// 	auto test_fut = hpx::async([]() {
 //		while(1){hpx::this_thread::yield();}
-	});
-	test_fut.get();
+// 	});
+// 	test_fut.get();
 
 	try {
 		if (opts.process_options(argc, argv)) {
 
 			auto all_locs = hpx::find_all_localities();
-			std::list<hpx::future<void>> futs;
+			std::vector<hpx::future<void>> futs;
+            futs.reserve(all_locs.size());
 			for (auto i = all_locs.begin(); i != all_locs.end(); ++i) {
 				futs.push_back(hpx::async < initialize_action > (*i, opts));
 			}
-			for (auto i = futs.begin(); i != futs.end(); ++i) {
-				i->get();
-			}
+            wait_all_and_propagate_exceptions(futs);
 
 			node_client root_id = hpx::new_ < node_server > (hpx::find_here());
 			node_client root_client(root_id);
@@ -159,9 +169,10 @@ int hpx_main(int argc, char* argv[]) {
 				//	set_problem(null_problem);
 				root_client.start_run(opts.problem == DWD && !opts.found_restart_file).get();
 			}
+            root_client.report_timing();
 		}
 	} catch (...) {
-
+        throw;
 	}
 	printf("Exiting...\n");
 	return hpx::finalize();
