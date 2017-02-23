@@ -8,29 +8,34 @@
 #ifndef GRID_HPP_
 #define GRID_HPP_
 
-#define NPF 5
-
 #include "simd.hpp"
 #include "defs.hpp"
 #include "roe.hpp"
 #include "space_vector.hpp"
 #include "geometry.hpp"
-#include <functional>
-#include <list>
-#include <set>
 #include "problem.hpp"
 #include "taylor.hpp"
 #include "scf_data.hpp"
-//#include <hpx/runtime/serialization/serialize.hpp>
+
+#ifdef RADIATION
+class rad_grid;
+#endif
+
+#include <hpx/runtime/serialization/serialize.hpp>
 #include <hpx/runtime/serialization/set.hpp>
 #include <hpx/runtime/serialization/array.hpp>
 #include <hpx/runtime/serialization/vector.hpp>
 
+#include <functional>
+#include <list>
+#include <memory>
+#include <set>
 
-//typedef double v4sd __attribute__ ((vector_size (32)));
 
+class struct_eos;
 
-struct analytic_t {
+class analytic_t {
+public:
 	std::array<real,NF> l1, l2, linf;
 	std::array<real,NF> l1a, l2a, linfa;
 	template<class Arc>
@@ -65,16 +70,6 @@ struct analytic_t {
 	}
 };
 
-#ifdef WD_EOS
-class wd_eos;
-using accretor_eos = wd_eos;
-using donor_eos = wd_eos;
-#else
-class bipolytropic_eos;
-using accretor_eos = bipolytropic_eos;
-using donor_eos = bipolytropic_eos;
-#endif
-
 struct interaction_type {
 	std::uint16_t first;
 	std::uint16_t second;
@@ -104,9 +99,9 @@ struct gravity_boundary_type {
 	}
 	void allocate() {
 		if (M == nullptr) {
-			M = std::shared_ptr < std::vector<multipole> > (new std::vector<multipole>);
-			m = std::shared_ptr < std::vector<real> > (new std::vector<real>);
-			x = std::shared_ptr < std::vector<space_vector> > (new std::vector<space_vector>);
+			M = std::make_shared<std::vector<multipole> >();
+			m = std::make_shared<std::vector<real> >();
+			x = std::make_shared<std::vector<space_vector> >();
 		}
 	}
 	template<class Archive>
@@ -129,6 +124,7 @@ void line_of_centers_analyze(const line_of_centers_t& loc, real omega, std::pair
 typedef real xpoint_type;
 typedef int zone_int_type;
 
+
 class grid {
 public:
 	static char const* field_names[];
@@ -149,6 +145,10 @@ private:
 	static space_vector pivot;
 	static real scaling_factor;
 
+#ifdef RADIATION
+	std::shared_ptr<rad_grid> rad_grid_ptr;
+#endif
+
 	std::vector<std::vector<real>> U;
 	std::vector<std::vector<real>> Ua;
 	std::vector<std::vector<real>> U0;
@@ -156,11 +156,16 @@ private:
 	std::vector<std::array<std::vector<real>, NF>> F;
 	std::vector<std::vector<real>> X;
 	std::vector<v4sd> G;
-	std::vector<multipole> M;
-	std::vector<real> mon;
+	std::shared_ptr<std::vector<multipole>> M_ptr;
+	std::shared_ptr<std::vector<real>> mon_ptr;
 	std::vector<expansion> L;
 	std::vector<space_vector> L_c;
 	std::vector<real> dphi_dt;
+#ifdef USE_GRAV_PAR
+    std::unique_ptr<hpx::lcos::local::spinlock> L_mtx;
+#endif
+
+//    std::shared_ptr<std::atomic<integer>> Muse_counter;
 
 	bool is_root;
 	bool is_leaf;
@@ -168,13 +173,23 @@ private:
 	std::array<real, NDIM> xmin;
 	std::vector<real> U_out;
 	std::vector<real> U_out0;
-	std::vector<std::vector<space_vector> > com;
+	std::vector<std::shared_ptr<std::vector<space_vector>>> com_ptr;
 	static bool xpoint_eq(const xpoint& a, const xpoint& b);
 	void compute_boundary_interactions_multipole_multipole(gsolve_type type, const std::vector<boundary_interaction_type>&, const gravity_boundary_type&);
 	void compute_boundary_interactions_monopole_monopole(gsolve_type type, const std::vector<boundary_interaction_type>&, const gravity_boundary_type&);
 	void compute_boundary_interactions_monopole_multipole(gsolve_type type, const std::vector<boundary_interaction_type>&, const gravity_boundary_type&);
 	void compute_boundary_interactions_multipole_monopole(gsolve_type type, const std::vector<boundary_interaction_type>&, const gravity_boundary_type&);
 public:
+#ifdef RADIATION
+	std::shared_ptr<rad_grid> get_rad_grid() {
+		return rad_grid_ptr;
+	}
+#endif
+	real get_dx() const;
+	std::vector<real>& get_field( integer f );
+	const std::vector<real>& get_field( integer f ) const;
+	void set_field( std::vector<real>&& data, integer f );
+	void set_field( const std::vector<real>& data, integer f );
 	analytic_t compute_analytic(real);
 	void compute_boundary_interactions(gsolve_type, const geo::direction&, bool is_monopole, const gravity_boundary_type&);
 	static void set_scaling_factor(real f);
@@ -201,7 +216,7 @@ public:
 	void set_hydro_boundary(const std::vector<real>&, const geo::direction&, integer width, bool tau_only = false);
 	std::vector<real> get_hydro_boundary(const geo::direction& face, integer width, bool tau_only = false);
 	scf_data_t scf_params();
-	real scf_update(real, real, real, real, real, real, real, accretor_eos, donor_eos);
+	real scf_update(real, real, real, real, real, real, real, struct_eos, struct_eos);
 	std::pair<std::vector<real>, std::vector<real> > field_range() const;
 	struct output_list_type;
 	static void merge_output_lists(output_list_type& l1, output_list_type&& l2);
@@ -239,9 +254,9 @@ public:
 	grid(real dx, std::array<real, NDIM>);
 	grid();
 	~grid();
-	grid(const grid&) = default;
+	grid(const grid&) = delete;
 	grid(grid&&) = default;
-	grid& operator=(const grid&) = default;
+	grid& operator=(const grid&) = delete;
 	grid& operator=(grid&&) = default;
 	std::pair<space_vector,space_vector> find_axis() const;
 	space_vector get_cell_center(integer i, integer j, integer k);
@@ -249,43 +264,17 @@ public:
    void allocate();
    void reconstruct();
    void store();
-   real compute_fluxes();
+   void restore();
+    real compute_fluxes();
    void compute_sources(real t);
    void set_physical_boundaries(const geo::face&, real t);
    void next_u(integer rk, real t, real dt);
    static void output(const output_list_type&, std::string, real t, int cycle, bool a);
    output_list_type get_output_list(bool analytic) const;
    template<class Archive>
-   void load(Archive& arc, const unsigned) {
-   	arc >> is_leaf;
-   	arc >> is_root;
-   	arc >> dx;
-   	arc >> xmin;
-   	allocate();
-   	arc >> U;
-   	for( integer i = 0; i != INX*INX*INX; ++i ) {
-   		arc >> G[i][0];
-   		arc >> G[i][1];
-   		arc >> G[i][2];
-   		arc >> G[i][3];
-   	}
-   	arc >> U_out;
-   }
+   void load(Archive& arc, const unsigned);
    template<class Archive>
-   void save(Archive& arc, const unsigned) const {
-   	arc << is_leaf;
-   	arc << is_root;
-   	arc << dx;
-   	arc << xmin;
-   	arc << U;
-   	for( integer i = 0; i != INX*INX*INX; ++i ) {
-   		arc << G[i][0];
-   		arc << G[i][1];
-   		arc << G[i][2];
-   		arc << G[i][3];
-   	}
-   	arc << U_out;
-   }
+   void save(Archive& arc, const unsigned) const;
    HPX_SERIALIZATION_SPLIT_MEMBER();
    std::size_t load(FILE* fp);
    std::size_t save(FILE* fp) const;
@@ -310,13 +299,13 @@ struct grid::node_point {
 struct grid::output_list_type {
 	std::set<node_point> nodes;
 	std::vector<zone_int_type> zones;
-	std::array<std::vector<real>, NF + NGF + NPF> data;
-	std::array<std::vector<real>, NF> analytic;
+	std::array<std::vector<real>, NF + NGF + NRF + NPF> data;
+	std::array<std::vector<real>, NF + NGF + NRF + NPF> analytic;
 	template<class Arc>
 	void serialize(Arc& arc, unsigned int) {
 		arc & nodes;
 		arc & zones;
-		for (integer i = 0; i != NF + NGF + NPF; ++i) {
+		for (integer i = 0; i != NF + NGF + NRF + NPF; ++i) {
 			arc & data[i];
 		}
 	}
@@ -324,5 +313,56 @@ struct grid::output_list_type {
 ;
 
 void scf_binary_init();
+
+#ifdef RADIATION
+#include "rad_grid.hpp"
+#endif
+
+template<class Archive>
+void grid::load(Archive& arc, const unsigned) {
+	arc >> is_leaf;
+	arc >> is_root;
+	arc >> dx;
+	arc >> xmin;
+	allocate();
+	arc >> U;
+#ifdef RADIATION
+	arc >> *rad_grid_ptr;
+#endif
+	for( integer i = 0; i != INX*INX*INX; ++i ) {
+#if defined(HPX_HAVE_DATAPAR)
+     arc >> G[i];
+#else
+		arc >> G[i][0];
+		arc >> G[i][1];
+		arc >> G[i][2];
+		arc >> G[i][3];
+#endif
+	}
+	arc >> U_out;
+}
+template<class Archive>
+void grid::save(Archive& arc, const unsigned) const {
+	arc << is_leaf;
+	arc << is_root;
+	arc << dx;
+	arc << xmin;
+	arc << U;
+#ifdef RADIATION
+	arc << *rad_grid_ptr;
+#endif
+	for( integer i = 0; i != INX*INX*INX; ++i ) {
+#if defined(HPX_HAVE_DATAPAR)
+     arc << G[i];
+#else
+		arc << G[i][0];
+		arc << G[i][1];
+		arc << G[i][2];
+		arc << G[i][3];
+#endif
+	}
+	arc << U_out;
+}
+
 
 #endif /* GRID_HPP_ */

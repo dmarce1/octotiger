@@ -9,12 +9,15 @@
 #define SIMD_VECTOR_HPP_
 #include "defs.hpp"
 #include <cstdlib>
+#include <cstdio>
 #include "immintrin.h"
 
-const std::size_t simd_len = 8;
+constexpr std::size_t simd_len = 8;
+
+#if !defined(HPX_HAVE_DATAPAR)
 
 #ifdef USE_SIMD
-#ifndef __MIC__
+#if !defined(__MIC__) && !defined(__AVX512F__)
 #define SIMD_SIZE 2
 #define __mxd __m256d
 #define _mmx_set_pd(d)    _mm256_set_pd((d),(d),(d),(d))
@@ -52,7 +55,9 @@ class simd_vector {
 private:
 	__mxd v[SIMD_SIZE];
 public:
-	simd_vector() = default;
+	simd_vector() {
+		*this = 0;
+	}
 	inline ~simd_vector() = default;
 	simd_vector(const simd_vector&) = default;
 	inline simd_vector(double d) {
@@ -249,7 +254,7 @@ public:
 			printf( "Error file %s line %i\n", __FILE__, __LINE__);
 			abort();
 		}
-		std::array<double, 4> n;
+//		std::array<double, 4> n;
 		auto j = other.begin();
 		for (int i = 0; i != 4; ++i) {
 			(*this)[i] = *j;
@@ -391,4 +396,15 @@ public:
 	}
 };
 */
+
+#else
+
+#include <hpx/parallel/traits/vector_pack_type.hpp>
+#include <hpx/runtime/serialization/datapar.hpp>
+
+using simd_vector = typename hpx::parallel::traits::vector_pack_type<double, 8>::type;
+using v4sd = typename hpx::parallel::traits::vector_pack_type<double, 4>::type;
+
+#endif
+
 #endif /* SIMD_VECTOR_HPP_ */

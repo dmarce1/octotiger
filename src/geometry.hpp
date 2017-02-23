@@ -10,6 +10,7 @@
 
 #include "defs.hpp"
 #include <cassert>
+#include <cstdlib>
 
 namespace geo {
 
@@ -151,13 +152,13 @@ public:
 
 	}
 	direction flip() const {
-		return direction(26 - i);
+		return direction(_count - i);
 	}
 	operator integer() const {
 		return (i < 14) ? i : (i - 1);
 	}
 	static constexpr integer count() {
-		return 26;
+		return _count;
 	}
 	static constexpr std::array<direction, _count> full_set() {
 		return { {0,1,2,3,4,5,6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23,24,25,26}};
@@ -176,11 +177,15 @@ public:
 	side get_side(const dimension&) const;
 	bool is_on_face(const face&) const;
 	quadrant get_quadrant(const dimension&) const;
+	face get_face(const dimension& d) const{
+		const integer o = *this;
+		return face(2 * d + ((o >> d) & 1));
+	}
 	integer operator[](const dimension& dim) const {
 		return (i >> dim) & 1;
 	}
 	octant neighbor(const direction& dir) {
-		integer ci = ZERO;
+		integer ci = static_cast<integer>(ZERO);
 		for (auto& d : dimension::full_set()) {
 			const integer bit = integer(1) << integer(d);
 			if (dir[d] == 0) {
@@ -284,7 +289,7 @@ constexpr integer quadrant::count() {
 	return _count;
 }
 
-constexpr std::array<quadrant, 4> quadrant::full_set() {
+constexpr std::array<quadrant, quadrant::count()> quadrant::full_set() {
 	return { {0,1,2,3}};
 }
 
@@ -339,6 +344,6 @@ inline face face::flip() const {
 constexpr integer INNER = 0;
 constexpr integer OUTER = 1;
 
-integer get_boundary_size(std::array<integer, NDIM>&, std::array<integer, NDIM>&, const geo::direction&, const geo::side&, integer inx, integer bw);
+integer get_boundary_size(std::array<integer, NDIM>&, std::array<integer, NDIM>&, const geo::direction&, const geo::side&, integer inx, integer bw, integer nx = -1);
 
 #endif /* GEOMETRY_HPP_ */
