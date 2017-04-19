@@ -12,6 +12,13 @@
 #include <functional>
 #include <algorithm>
 
+#include <hpx/include/threads.hpp>
+#include <hpx/include/run_as.hpp>
+
+#include "options.hpp"
+
+real LambertW(real z);
+
 inline integer refinement_freq() {
 	return  integer(R_BW / cfl + 0.5);
 }
@@ -19,14 +26,21 @@ int file_copy(const char* fin, const char* fout);
 
 template<class... Args>
 int lprintf( const char* log, const char* str, Args&&...args) {
-	FILE* fp = fopen (log, "at");
-	if( fp == NULL) {
-		return -1;
-	}
-	fprintf( fp, str, std::forward<Args>(args)...);
-	printf( str, std::forward<Args>(args)...);
-	fclose(fp);
-	return 0;
+    // run output on separate thread
+    auto f = hpx::threads::run_as_os_thread([&]() -> int
+    {
+        if(!opts.disable_output) {
+            FILE* fp = fopen (log, "at");
+	        if( fp == NULL) {
+		        return -1;
+	        }
+	        fprintf( fp, str, std::forward<Args>(args)...);
+	        fclose(fp);
+	    }
+        printf( str, std::forward<Args>(args)...);
+	    return 0;
+    });
+    return f.get();
 }
 
 

@@ -126,14 +126,9 @@ node_location node_location::get_child(integer c) const {
 }
 
 std::string node_location::to_str() const {
-	char* ptr;
-	if (asprintf(&ptr, "lev = %i x = %i y = %i z = %i", int(lev), int(xloc[XDIM]), int(xloc[YDIM]), int(xloc[ZDIM]))
-			== 0) {
-		abort();
-	}
-	auto str = std::string(ptr);
-	free(ptr);
-	return str;
+    char buffer[100];    // 21 bytes for int (max) + some leeway
+    sprintf(buffer, "lev = %i x = %i y = %i z = %i", int(lev), int(xloc[XDIM]), int(xloc[YDIM]), int(xloc[ZDIM]));
+    return std::string(buffer);
 }
 
 node_location node_location::get_parent() const {
@@ -235,6 +230,36 @@ std::size_t node_location::unique_id() const {
  return hpx::find_id_from_basename("node_location", unique_id());
  }
  */
+
+node_location node_location::get_neighbor(const geo::direction dir) const {
+	node_location nloc;
+	nloc = *this;
+	for( auto d : geo::dimension::full_set()) {
+		nloc.xloc[d] += dir[d];
+	}
+	return nloc;
+}
+
+
+bool node_location::has_neighbor(const geo::direction dir) const {
+	bool rc = true;;
+	for( auto d : geo::dimension::full_set()) {
+		if( dir[d] == -1 ) {
+			if( xloc[d] == 0 ) {
+				rc = false;
+				break;
+			}
+		}
+		else if( dir[d] == +1 ) {
+			if( xloc[d] == ((1 << level()) - 1) ) {
+				rc = false;
+				break;
+			}
+		}
+	}
+	return rc;
+}
+
 bool node_location::is_physical_boundary(integer face) const {
 	bool rc = false;
 	const integer dim = face / 2;
