@@ -1,42 +1,67 @@
-#include <fenv.h>
 #include "defs.hpp"
 
 #include "node_server.hpp"
 #include "node_client.hpp"
 #include "future.hpp"
-#include <chrono>
-#include <unistd.h>
-#include <hpx/hpx_init.hpp>
 #include "problem.hpp"
-
 #include "options.hpp"
+
+#include <chrono>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <fenv.h>
+#if !defined(_MSC_VER)
+#include <unistd.h>
+#else
+#include <float.h>
+#endif
+
+#include <hpx/hpx_init.hpp>
+#include <hpx/include/lcos.hpp>
+#include <hpx/lcos/broadcast.hpp>
+
 options opts;
 
 bool gravity_on = true;
 bool hydro_on = true;
 HPX_PLAIN_ACTION(grid::set_pivot, set_pivot_action);
+HPX_REGISTER_BROADCAST_ACTION_DECLARATION(set_pivot_action)
+HPX_REGISTER_BROADCAST_ACTION(set_pivot_action)
 
 void compute_ilist();
 
-void initialize(options _opts) {
+void initialize(options _opts, std::vector<hpx::id_type> const& localities)
+{
+    options::all_localities = localities;
 	opts = _opts;
-//#ifndef NDEBUG
+    grid::get_omega() = opts.omega;
+#if !defined(_MSC_VER)
 	feenableexcept (FE_DIVBYZERO);
 	feenableexcept (FE_INVALID);
 	feenableexcept (FE_OVERFLOW);
-//#endif
+#else
+    _controlfp(_EM_INEXACT | _EM_DENORMAL | _EM_INVALID, _MCW_EM);
+#endif
 	grid::set_scaling_factor(opts.xscale);
 	grid::set_max_level(opts.max_level);
-
+#ifdef RADIATION
+	if (opts.problem == RADIATION_TEST) {
+		gravity_on = false;
+		set_problem(radiation_test_problem);
+		set_refine_test(radiation_test_refine);
+	} else
+#endif
 	if (opts.problem == DWD) {
 		set_problem(scf_binary);
-		set_refine_test(refine_test_bibi);
+		set_refine_test(refine_test);
 	} else if (opts.problem == SOD) {
 		grid::set_fgamma(7.0 / 5.0);
 		gravity_on = false;
-		set_problem(sod_shock_tube);
+		set_problem(sod_shock_tube_init);
 		set_refine_test (refine_sod);
-		grid::set_analytic_func(sod_shock_tube);
+		grid::set_analytic_func(sod_shock_tube_analytic);
 	} else if (opts.problem == BLAST) {
 		grid::set_fgamma(7.0 / 5.0);
 		gravity_on = false;
@@ -85,85 +110,101 @@ void initialize(options _opts) {
 }
 
 HPX_PLAIN_ACTION(initialize, initialize_action);
+HPX_REGISTER_BROADCAST_ACTION_DECLARATION(initialize_action)
+HPX_REGISTER_BROADCAST_ACTION(initialize_action)
 
 real OMEGA;
 void node_server::set_pivot() {
-	auto localities = hpx::find_all_localities();
-	space_vector pivot = grid_ptr->center_of_mass();
-	std::vector<hpx::future<void>> futs;
-	futs.reserve(localities.size());
-	for (auto& locality : localities) {
-		if (current_time == ZERO) {
-			futs.push_back(hpx::async < set_pivot_action > (locality, pivot));
-		}
-	}
-	for (auto&& fut : futs) {
-		fut.get();
-	}
+    space_vector pivot = grid_ptr->center_of_mass();
+    hpx::lcos::broadcast<set_pivot_action>(options::all_localities, pivot).get();
 }
 
 int hpx_main(int argc, char* argv[]) {
-	printf("Running\n");
-	auto test_fut = hpx::async([]() {
-//		while(1){hpx::this_thread::yield();}
-	});
-	test_fut.get();
+    printf("###########################################################\n");
+    #if defined(__AVX512F__)
+        printf("Compiled for AVX512 SIMD architectures.\n");
+    #elif defined(__AVX2__)
+        printf("Compiled for AVX2 SIMD architectures.\n");
+    #elif defined(__AVX__)
+        printf("Compiled for AVX SIMD architectures.\n");
+    #elif defined(__SSE2__ )
+        printf("Compiled for SSE2 SIMD architectures.\n");
+    #else
+        printf("Not compiled for a known SIMD architecture.\n");
+    #endif
+    printf("###########################################################\n");
 
-	try {
-		if (opts.process_options(argc, argv)) {
+    printf("Running\n");
 
-			auto all_locs = hpx::find_all_localities();
-			std::list<hpx::future<void>> futs;
-			for (auto i = all_locs.begin(); i != all_locs.end(); ++i) {
-				futs.push_back(hpx::async < initialize_action > (*i, opts));
-			}
-			for (auto i = futs.begin(); i != futs.end(); ++i) {
-				i->get();
-			}
+    try {
+        if (opts.process_options(argc, argv)) {
+            auto all_locs = hpx::find_all_localities();
+            hpx::lcos::broadcast<initialize_action>(all_locs, opts, all_locs).get();
 
-			node_client root_id = hpx::new_ < node_server > (hpx::find_here());
-			node_client root_client(root_id);
+            node_client root_id = hpx::new_ < node_server > (hpx::find_here());
+            node_client root_client(root_id);
+            node_server* root = root_client.get_ptr().get();
 
-			if (opts.found_restart_file) {
-				set_problem(null_problem);
-				const std::string fname = opts.restart_filename;
-				printf("Loading from %s...\n", fname.c_str());
-				if (opts.output_only) {
-					const std::string oname = opts.output_filename;
-					root_client.get_ptr().get()->load_from_file_and_output(fname, oname);
-				} else {
-					root_client.get_ptr().get()->load_from_file(fname);
-					root_client.regrid(root_client.get_gid(), true).get();
-				}
-				printf("Done. \n");
-			} else {
-				for (integer l = 0; l < opts.max_level; ++l) {
-					root_client.regrid(root_client.get_gid(), false).get();
-					printf("---------------Created Level %i---------------\n\n", int(l + 1));
-				}
-				root_client.regrid(root_client.get_gid(), false).get();
-				printf("---------------Regridded Level %i---------------\n\n", int(opts.max_level));
-			}
+            int ngrids = 0;
+            if (opts.found_restart_file) {
+                set_problem(null_problem);
+                const std::string fname = opts.restart_filename;
+                printf("Loading from %s...\n", fname.c_str());
+                if (opts.output_only) {
+                    const std::string oname = opts.output_filename;
+                    root->load_from_file_and_output(fname, oname, opts.data_dir);
+                } else {
+                    root->load_from_file(fname, opts.data_dir);
+                    ngrids = root->regrid(root_client.get_gid(), ZERO, -1, true);
 
-			std::vector < hpx::id_type > null_sibs(geo::direction::count());
-			printf("Forming tree connections------------\n");
-			root_client.form_tree(root_client.get_gid(), hpx::invalid_id, null_sibs).get();
-			if (gravity_on) {
-				//real tstart = MPI_Wtime();
-				root_client.solve_gravity(false).get();
-				//	printf("Gravity Solve Time = %e\n", MPI_Wtime() - tstart);
-			}
-			printf("...done\n");
+                    if (opts.max_restart_level > 0)
+                    {
+                        for (integer l = 0; l < opts.max_restart_level - 1; ++l)
+                        {
+                            ngrids = root->regrid(root_client.get_gid(), grid::get_omega(), -1, false);
+                            printf("---------------Created Level %i---------------\n\n", int(l + 1));
+                        }
+                    }
+                }
+                printf("Done. \n");
+            } else {
+                for (integer l = 0; l < opts.max_level; ++l) {
+                    ngrids = root->regrid(root_client.get_gid(), grid::get_omega(), -1, false);
+                    printf("---------------Created Level %i---------------\n\n", int(l + 1));
+                }
+                ngrids = root->regrid(root_client.get_gid(), grid::get_omega(), -1, false);
+                printf("---------------Regridded Level %i---------------\n\n", int(opts.max_level));
+            }
 
-			if (!opts.output_only) {
-				//	set_problem(null_problem);
-				root_client.start_run(opts.problem == DWD && !opts.found_restart_file).get();
-			}
-		}
-	} catch (...) {
+            if (gravity_on && !opts.output_only) {
+                printf("solving gravity------------\n");
+                root->solve_gravity(false);
+                printf("...done\n");
+            }
 
-	}
-	printf("Exiting...\n");
-	return hpx::finalize();
+            if (!opts.output_only) {
+                //  set_problem(null_problem);
+                hpx::async(&node_server::start_run, root, opts.problem == DWD && !opts.found_restart_file, ngrids).get();
+//              root->start_run(opts.problem == DWD && !opts.found_restart_file, ngrids);
+            }
+            root->report_timing();
+        }
+    } catch (...) {
+        throw;
+    }
+    printf("Exiting...\n");
+    return hpx::finalize();
 }
 
+int main(int argc, char* argv[])
+{
+    std::vector<std::string> cfg = {
+        "hpx.commandline.allow_unknown=1",         // HPX should not complain about unknown command line options
+        "hpx.scheduler=local-priority-lifo",       // use LIFO scheduler by default
+        "hpx.parcel.mpi.zero_copy_optimization!=0" // Disable the usage of zero copy optimization for MPI...
+    };
+
+    hpx::register_pre_shutdown_function([](){options::all_localities.clear(); });
+
+    hpx::init(argc, argv, cfg);
+}

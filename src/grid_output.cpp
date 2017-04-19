@@ -1,10 +1,20 @@
+#include "defs.hpp"
 #include "grid.hpp"
 #ifdef DO_OUTPUT
 #include <silo.h>
 #endif
+#include <atomic>
 #include <fstream>
 #include <thread>
 #include <cmath>
+#include "physcon.hpp"
+#include "options.hpp"
+
+extern options opts;
+
+#ifdef RADIATION
+#include "rad_grid.hpp"
+#endif
 
 #include <hpx/include/lcos.hpp>
 //#define EQ_ONLY
@@ -18,9 +28,13 @@ std::vector<std::vector<real>>& TLS_V();
 
 #include <unordered_map>
 
+
+
+
 inline bool float_eq(xpoint_type a, xpoint_type b) {
-	const xpoint_type small = std::pow(xpoint_type(2), -23);
-	return std::abs(a - b) < small;
+	constexpr static xpoint_type eps = 0.00000011920928955078125; // std::pow(xpoint_type(2), -23);
+// 	const xpoint_type eps = std::pow(xpoint_type(2), -23);
+	return std::abs(a - b) < eps;
 }
 
 bool grid::xpoint_eq(const xpoint& a, const xpoint& b) {
@@ -54,9 +68,7 @@ void grid::merge_output_lists(grid::output_list_type& l1, grid::output_list_type
 	std::unordered_map<zone_int_type, zone_int_type> index_map;
 
 	if (l2.zones.size() > l1.zones.size()) {
-		auto tmp = std::move(l2);
-		l2 = std::move(l1);
-		l1 = std::move(tmp);
+		std::swap(l1, l2);
 	}
 	for (auto i = l2.nodes.begin(); i != l2.nodes.end(); ++i) {
 		zone_int_type index, oindex;
@@ -78,48 +90,49 @@ void grid::merge_output_lists(grid::output_list_type& l1, grid::output_list_type
 		l1.zones[zzz] = index_map[*i];
 		++zzz;
 	}
-	for (integer field = 0; field < NF + NGF + NPF; ++field) {
+	for (integer field = 0; field < NF + NRF + NGF + NPF; ++field) {
 		const auto l1sz = l1.data[field].size();
 		l1.data[field].resize(l1sz + l2.data[field].size());
 		std::move(l2.data[field].begin(), l2.data[field].end(), l1.data[field].begin() + l1sz);
 	}
-	if( l1.analytic.size()) {
+	if (l1.analytic.size()) {
 		for (integer field = 0; field < NF; ++field) {
 			const auto l1sz = l1.analytic[field].size();
 			l1.analytic[field].resize(l1sz + l2.analytic[field].size());
 			std::move(l2.analytic[field].begin(), l2.analytic[field].end(), l1.analytic[field].begin() + l1sz);
-		}}
+		}
+	}
 }
 
 grid::output_list_type grid::get_output_list(bool analytic) const {
 	auto& V = TLS_V();
-	compute_primitives();
+	compute_primitives( { { H_BW+1, H_BW+1, H_BW+1 } }, { { H_NX - H_BW-1, H_NX - H_BW-1, H_NX - H_BW-1 } });
 	output_list_type rc;
 	const integer vertex_order[8] = { 0, 1, 3, 2, 4, 5, 7, 6 };
 
 	std::set<node_point>& node_list = rc.nodes;
 	std::vector<zone_int_type>& zone_list = rc.zones;
-	std::array < std::vector<real>, NF + NGF + NPF > &data = rc.data;
-	std::array < std::vector<real>, NF > &A = rc.analytic;
+	std::array<std::vector<real>, NF + NRF + NGF + NPF> &data = rc.data;
+	std::array<std::vector<real>, NF + NRF + NGF + NPF> &A = rc.analytic;
 
-	for (integer field = 0; field != NF + NGF + NPF; ++field) {
+	for (integer field = 0; field != NF + NRF + NGF + NPF; ++field) {
 		data[field].reserve(INX * INX * INX);
 		if (analytic) {
 			A[field].reserve(INX * INX * INX);
 		}
 	}
 	const integer this_bw = H_BW;
-	zone_list.reserve(std::pow(H_NX - 2 * this_bw, NDIM) * NCHILD);
+	zone_list.reserve(cube(H_NX - 2 * this_bw) * NCHILD);
 	for (integer i = this_bw; i != H_NX - this_bw; ++i) {
 		for (integer j = this_bw; j != H_NX - this_bw; ++j) {
 			for (integer k = this_bw; k != H_NX - this_bw; ++k) {
 				const integer iii = hindex(i, j, k);
 				const integer iiig = gindex(i - H_BW, j - H_BW, k - H_BW);
-#ifdef EQ_ONLY
-				if (!(std::abs(X[ZDIM][iii]) < dx) && !(std::abs(X[YDIM][iii]) < dx)) {
-					continue;
+				if (opts.silo_planes_only) {
+					if (!(std::abs(X[ZDIM][iii]) < dx) && !(std::abs(X[YDIM][iii]) < dx)) {
+						continue;
+					}
 				}
-#endif
 				for (integer ci = 0; ci != NVERTEX; ++ci) {
 					const integer vi = vertex_order[ci];
 					const integer xi = (vi >> 0) & 1;
@@ -149,18 +162,22 @@ grid::output_list_type grid::get_output_list(bool analytic) const {
 				for (integer field = 0; field != NF; ++field) {
 					data[field].push_back(U[field][iii]);
 				}
+#ifdef RADIATION
+				const integer d = H_BW - R_BW;
+				rad_grid_ptr->get_output(data, i - d, j - d, k - d);
+#endif
 				for (integer field = 0; field != NGF; ++field) {
-					data[field + NF].push_back(G[iiig][field]);
+					data[field + NRF + NF].push_back(G[iiig][field]);
 				}
-				data[NGF + NF + 0].push_back(V[vx_i][iii]);
-				data[NGF + NF + 1].push_back(V[vy_i][iii]);
-				data[NGF + NF + 2].push_back(V[vz_i][iii]);
+				data[NGF + NRF + NF + 0].push_back(V[vx_i][iii]);
+				data[NGF + NRF + NF + 1].push_back(V[vy_i][iii]);
+				data[NGF + NRF + NF + 2].push_back(V[vz_i][iii]);
 				if (V[egas_i][iii] * V[rho_i][iii] < de_switch2 * U[egas_i][iii]) {
-					data[NGF + NF + 3].push_back(std::pow(V[tau_i][iii], fgamma) / V[rho_i][iii]);
+					data[NGF + NRF + NF + 3].push_back(std::pow(V[tau_i][iii], fgamma) / V[rho_i][iii]);
 				} else {
-					data[NGF + NF + 3].push_back(V[egas_i][iii]);
+					data[NGF + NRF + NF + 3].push_back(V[egas_i][iii]);
 				}
-				data[NGF + NF + 4].push_back(V[zz_i][iii]);
+				data[NGF + NRF + NF + 4].push_back(V[zz_i][iii]);
 			}
 		}
 	}
@@ -168,110 +185,185 @@ grid::output_list_type grid::get_output_list(bool analytic) const {
 	return rc;
 }
 
-void grid::output(const output_list_type& olists, std::string _filename, real _t, int cycle, bool analytic) {
+void make_names(std::vector<char*>& names, std::vector<int>& types,
+    std::string dirname, std::string base, std::string title, int type)
+{
+	const integer sz = names.size();
+	//std::string base_dirname = dirname + base + std::string(".silo.data");
+	for (integer i = 0; i != sz; ++i) {
+		std::string name = dirname + base + std::string(".") + std::to_string(i)
+                         + std::string(".silo:") + title;
+		names[i] = (char*) malloc(name.size() + 1);
+		types[i] = type;
+		strcpy(names[i], name.c_str());
+//		printf("make_names: name[%i]('%s') dirname('%s') base('%s') title('%s')\n",
+//            i, names[i], dirname.c_str(), base.c_str(), title.c_str());
+	}
+}
+
+void delete_names(std::vector<char*>& names) {
+	const integer sz = names.size();
+	for (integer i = 0; i != sz; ++i) {
+		free(names[i]);
+	}
+}
+
+void grid::output_header(std::string dirname, std::string base, real t, int cycle, bool a, int procs) {
 #ifdef DO_OUTPUT
-
-	std::thread(
-		[&](const std::string& filename, real t) {
-			printf( "t = %e\n", t);
-			const std::set<node_point>& node_list = olists.nodes;
-			const std::vector<zone_int_type>& zone_list = olists.zones;
-
-			const int nzones = zone_list.size() / NVERTEX;
-			std::vector<int> zone_nodes;
-			zone_nodes = std::move(zone_list);
-
-			const int nnodes = node_list.size();
-			std::vector<double> x_coord(nnodes);
-			std::vector<double> y_coord(nnodes);
-			std::vector<double> z_coord(nnodes);
-			std::array<double*, NDIM> node_coords = {x_coord.data(), y_coord.data(), z_coord.data()};
-			for (auto iter = node_list.begin(); iter != node_list.end(); ++iter) {
-				const integer i = iter->index;
-				x_coord[i] = iter->pt[0];
-				y_coord[i] = iter->pt[1];
-				z_coord[i] = iter->pt[2];
-			}
-
-			constexpr
-			int nshapes = 1;
-			int shapesize[1] = {NVERTEX};
-			int shapetype[1] = {DB_ZONETYPE_HEX};
-			int shapecnt[1] = {nzones};
-			const char* coord_names[NDIM] = {"x", "y", "z"};
-
-#ifndef	__MIC__
+	std::thread([&]() {
 		auto olist = DBMakeOptlist(1);
 		double time = double(t);
 		int ndim = 3;
-		DBAddOption(olist, DBOPT_CYCLE, &cycle);
 		DBAddOption(olist, DBOPT_DTIME, &time);
-		DBAddOption(olist, DBOPT_NSPACE, &ndim );
+		std::string filename = dirname + base + std::string(".silo");
+//		printf("grid::output_header: filename('%s') dirname('%s') base('%s')\n",
+//            filename.c_str(), dirname.c_str(), base.c_str());
 		DBfile *db = DBCreateReal(filename.c_str(), DB_CLOBBER, DB_LOCAL, "Euler Mesh", DB_PDB);
 		assert(db);
-		DBPutZonelist2(db, "zones", nzones, int(NDIM), zone_nodes.data(), nzones * NVERTEX, 0, 0, 0, shapetype, shapesize,
-			shapecnt, nshapes, olist);
-		DBPutUcdmesh(db, "mesh", int(NDIM), const_cast<char**>(coord_names), node_coords.data(), nnodes, nzones, "zones", nullptr, DB_DOUBLE,
-			olist);
+		std::vector<char*> names(procs);
+		std::vector<int> types(procs);
+		make_names(names, types, dirname, base, "mesh", DB_UCDMESH);
+		DBPutMultimesh(db, "mesh", procs, names.data(), types.data(), olist);
+		delete_names(names);
 		const char* analytic_names[] = {"rho_a", "egas_a", "sx_a", "sy_a", "sz_a", "tau_a"};
-		DBFreeOptlist(olist);
-		for (int field = 0; field != NF + NGF + NPF; ++field) {
-			auto olist = DBMakeOptlist(1);
-			double time = double(t);
-			int istrue = 1;
-			int isfalse = 0;
-			DBAddOption(olist, DBOPT_CYCLE, &cycle);
-			DBAddOption(olist, DBOPT_DTIME, &time);
-			DBAddOption(olist, DBOPT_NSPACE, &ndim );
-			if( field == rho_i || field == sx_i || field == sy_i || field == sz_i || field == spc_ac_i || field == spc_ae_i || field == spc_dc_i || field == spc_de_i || field == spc_vac_i ) {
-				DBAddOption(olist, DBOPT_CONSERVED, &istrue);
-			} else {
-				DBAddOption(olist, DBOPT_CONSERVED, &isfalse );
-			}
-			if( field < NF ) {
-				DBAddOption(olist, DBOPT_EXTENSIVE, &istrue);
-			} else {
-				DBAddOption(olist, DBOPT_EXTENSIVE, &isfalse);
-			}
-			DBAddOption(olist, DBOPT_EXTENSIVE, &istrue);
-			DBPutUcdvar1(db, field_names[field], "mesh", const_cast<void*>(reinterpret_cast<const void*>(olists.data[field].data())), nzones, nullptr, 0, DB_DOUBLE, DB_ZONECENT,
-				olist);
+		for (int field = 0; field != NF + NGF + NPF + NRF; ++field) {
+			make_names(names, types, dirname, base, field_names[field], DB_UCDVAR);
+			DBPutMultivar(db, field_names[field], procs, names.data(), types.data(), olist);
+			delete_names(names);
 			if( analytic && field < 6) {
-				DBPutUcdvar1(db, analytic_names[field], "mesh", const_cast<void*>(reinterpret_cast<const void*>(olists.analytic[field].data())), nzones, nullptr, 0, DB_DOUBLE, DB_ZONECENT,
-					olist);
+				make_names(names, types, dirname, base, analytic_names[field], DB_UCDVAR);
+				DBPutMultivar(db, analytic_names[field], procs, names.data(), types.data(), olist);
+				delete_names(names);
 			}
-			DBFreeOptlist(olist);
-#ifdef RHO_ONLY
-		break;
-#endif
-	}
-	DBClose(db);
-#endif
-	}, _filename, _t).join();
+		}
+		DBFreeOptlist(olist);
+		DBClose(db);
+	}).join();
 #endif
 }
 
-std::size_t grid::load(FILE* fp) {
+void grid::output(const output_list_type& olists,
+    std::string _dirname, std::string _base,
+    real _t, int cycle, bool analytic) {
+#ifdef DO_OUTPUT
+	std::thread(
+			[&](const std::string& dirname, const std::string& base, real t) {
+				const std::set<node_point>& node_list = olists.nodes;
+				const std::vector<zone_int_type>& zone_list = olists.zones;
+
+				const int nzones = zone_list.size() / NVERTEX;
+				std::vector<int> zone_nodes;
+				zone_nodes = std::move(zone_list);
+
+				const int nnodes = node_list.size();
+				std::vector<double> x_coord(nnodes);
+				std::vector<double> y_coord(nnodes);
+				std::vector<double> z_coord(nnodes);
+				std::array<double*, NDIM> node_coords = {x_coord.data(), y_coord.data(), z_coord.data()};
+				for (auto iter = node_list.begin(); iter != node_list.end(); ++iter) {
+					const integer i = iter->index;
+					x_coord[i] = iter->pt[0];
+					y_coord[i] = iter->pt[1];
+					z_coord[i] = iter->pt[2];
+				}
+
+				constexpr int nshapes = 1;
+				int shapesize[1] = {NVERTEX};
+				int shapetype[1] = {DB_ZONETYPE_HEX};
+				int shapecnt[1] = {nzones};
+				const char* coord_names[NDIM] = {"x", "y", "z"};
+				auto olist = DBMakeOptlist(1);
+				double time = double(t);
+				int ndim = 3;
+				//DBAddOption(olist, DBOPT_CYCLE, &cycle);
+				DBAddOption(olist, DBOPT_DTIME, &time);
+				//DBAddOption(olist, DBOPT_NSPACE, &ndim );
+                std::string filename = dirname + base;
+//        		printf("grid::output: filename('%s') dirname('%s') base('%s')\n",
+//                    filename.c_str(), dirname.c_str(), base.c_str());
+				DBfile *db = DBCreateReal(filename.c_str(), DB_CLOBBER, DB_LOCAL, "Euler Mesh", DB_PDB);
+				assert(db);
+				DBPutZonelist2(db, "zones", nzones, int(NDIM), zone_nodes.data(), nzones * NVERTEX, 0, 0, 0, shapetype, shapesize,
+						shapecnt, nshapes, olist);
+				DBPutUcdmesh(db, "mesh", int(NDIM), const_cast<char**>(coord_names), node_coords.data(), nnodes, nzones, "zones", nullptr, DB_DOUBLE,
+						olist);
+				const char* analytic_names[] = {"rho_a", "egas_a", "sx_a", "sy_a", "sz_a", "tau_a"};
+				DBFreeOptlist(olist);
+				for (int field = 0; field != NF + NGF + NPF + NRF; ++field) {
+					auto olist = DBMakeOptlist(1);
+					double time = double(t);
+					int istrue = 1;
+					int isfalse = 0;
+					//DBAddOption(olist, DBOPT_CYCLE, &cycle);
+					DBAddOption(olist, DBOPT_DTIME, &time);
+					//DBAddOption(olist, DBOPT_NSPACE, &ndim );
+					//if( field == rho_i || field == sx_i || field == sy_i || field == sz_i || field == spc_ac_i || field == spc_ae_i || field == spc_dc_i || field == spc_de_i || field == spc_vac_i ) {
+					//	DBAddOption(olist, DBOPT_CONSERVED, &istrue);
+					//} else {
+					//	DBAddOption(olist, DBOPT_CONSERVED, &isfalse );
+					//}
+					//if( field < NF ) {
+					//	DBAddOption(olist, DBOPT_EXTENSIVE, &istrue);
+					//} else {
+					//	DBAddOption(olist, DBOPT_EXTENSIVE, &isfalse);
+					//}
+					//DBAddOption(olist, DBOPT_EXTENSIVE, &istrue);
+					DBPutUcdvar1(db, field_names[field], "mesh", const_cast<void*>(reinterpret_cast<const void*>(olists.data[field].data())), nzones, nullptr, 0, DB_DOUBLE, DB_ZONECENT,
+							olist);
+					if( analytic && field < 6) {
+						DBPutUcdvar1(db, analytic_names[field], "mesh", const_cast<void*>(reinterpret_cast<const void*>(olists.analytic[field].data())), nzones, nullptr, 0, DB_DOUBLE, DB_ZONECENT,
+								olist);
+					}
+					DBFreeOptlist(olist);
+				}
+				DBClose(db);
+			}, _dirname, _base, _t).join();
+#endif
+}
+
+std::size_t grid::load(FILE* fp, bool old_format) {
+	static hpx::mutex mtx;
 	std::size_t cnt = 0;
-	auto foo = std::fread;
 	{
-		static hpx::mutex mtx;
-		std::lock_guard < hpx::mutex > lock(mtx);
-		cnt += foo(&scaling_factor, sizeof(real), 1, fp) * sizeof(real);
-		cnt += foo(&max_level, sizeof(integer), 1, fp) * sizeof(integer);
-		cnt += foo(&Acons, sizeof(real), 1, fp) * sizeof(real);
-		cnt += foo(&Bcons, sizeof(integer), 1, fp) * sizeof(integer);
+		static std::atomic<bool> statics_loaded(false);
+        bool expected = false;
+		if(statics_loaded.compare_exchange_strong(expected, true)) {
+			cnt += std::fread(&scaling_factor, sizeof(real), 1, fp) * sizeof(real);
+			if( opts.ngrids > -1 && !opts.refinement_floor_specified) {
+				cnt += std::fread(&opts.refinement_floor, sizeof(real), 1, fp) * sizeof(real);
+			} else {
+				real dummy;
+				cnt += std::fread(&dummy, sizeof(real), 1, fp) * sizeof(real);
+			}
+			if( !old_format ) {
+				cnt += std::fread(&physcon.A, sizeof(real), 1, fp) * sizeof(real);
+				cnt += std::fread(&physcon.B, sizeof(real), 1, fp) * sizeof(real);
+			}
+			statics_loaded = true;
+		} else {
+			std::size_t offset = (old_format ? 2 : 4) * sizeof(real);
+            std::fseek(fp, offset, SEEK_CUR);
+			cnt += offset;
+		}
 	}
-	cnt += foo(&is_leaf, sizeof(bool), 1, fp) * sizeof(bool);
-	cnt += foo(&is_root, sizeof(bool), 1, fp) * sizeof(bool);
+
+	cnt += std::fread(&is_leaf, sizeof(bool), 1, fp) * sizeof(bool);
+	cnt += std::fread(&is_root, sizeof(bool), 1, fp) * sizeof(bool);
 
 	allocate();
 
 	for (integer f = 0; f != NF; ++f) {
 		for (integer i = H_BW; i < H_NX - H_BW; ++i) {
 			for (integer j = H_BW; j < H_NX - H_BW; ++j) {
-				const integer iii = hindex(i, j, H_BW);
-				cnt += foo(&(U[f][iii]), sizeof(real), INX, fp) * sizeof(real);
+				if( f < NF - 3 || !old_format) {
+					const integer iii = hindex(i, j, H_BW);
+					cnt += std::fread(&(U[f][iii]), sizeof(real), INX, fp) * sizeof(real);
+				} else {
+					for( integer k = H_BW; k != H_NX - H_BW; ++k) {
+						const integer iii = hindex(i, j, k);
+						U[f][iii] = 0.0;
+					}
+				}
 			}
 		}
 	}
@@ -279,45 +371,61 @@ std::size_t grid::load(FILE* fp) {
 		for (integer j = 0; j < G_NX; ++j) {
 			for (integer k = 0; k < G_NX; ++k) {
 				const integer iii = gindex(i, j, k);
-				cnt += foo(&(G[iii][0]), sizeof(real), NGF, fp) * sizeof(real);
+				for( integer f = 0; f != NGF; ++f ) {
+					real tmp;
+					cnt += std::fread(&tmp, sizeof(real), 1, fp) * sizeof(real);
+					G[iii][f] = tmp;
+				}
 			}
 		}
 	}
-	cnt += foo(U_out.data(), sizeof(real), U_out.size(), fp) * sizeof(real);
+	if (!old_format) {
+		cnt += std::fread(U_out.data(), sizeof(real), U_out.size(), fp) * sizeof(real);
+	} else {
+		std::fill(U_out.begin(), U_out.end(), 0.0);
+		cnt += std::fread(U_out.data(), sizeof(real), U_out.size() - 3, fp) * sizeof(real);
+	}
+#ifdef RADIATION
+	cnt += rad_grid_ptr->load(fp);
+#endif
 	set_coordinates();
 	return cnt;
 }
 
-std::size_t grid::save(FILE* fp) const {
-	std::size_t cnt = 0;
-	auto foo = std::fwrite;
-	{
-		static hpx::mutex mtx;
-		std::lock_guard < hpx::mutex > lock(mtx);
-		cnt += foo(&scaling_factor, sizeof(real), 1, fp) * sizeof(real);
-		cnt += foo(&max_level, sizeof(integer), 1, fp) * sizeof(integer);
-		cnt += foo(&Acons, sizeof(real), 1, fp) * sizeof(real);
-		cnt += foo(&Bcons, sizeof(integer), 1, fp) * sizeof(integer);
-	}
-	cnt += foo(&is_leaf, sizeof(bool), 1, fp) * sizeof(bool);
-	cnt += foo(&is_root, sizeof(bool), 1, fp) * sizeof(bool);
-	for (integer f = 0; f != NF; ++f) {
-		for (integer i = H_BW; i < H_NX - H_BW; ++i) {
-			for (integer j = H_BW; j < H_NX - H_BW; ++j) {
-				const integer iii = hindex(i, j, H_BW);
-				cnt += foo(&(U[f][iii]), sizeof(real), INX, fp) * sizeof(real);
-			}
-		}
-	}
-	for (integer i = 0; i < G_NX; ++i) {
-		for (integer j = 0; j < G_NX; ++j) {
-			for (integer k = 0; k < G_NX; ++k) {
-				const integer iii = gindex(i, j, k);
-				cnt += foo(&(G[iii][0]), sizeof(real), NGF, fp) * sizeof(real);
-			}
-		}
-	}
-	cnt += foo(U_out.data(), sizeof(real), U_out.size(), fp) * sizeof(real);
-	return cnt;
+std::size_t grid::save(std::ostream& strm) const {
+    std::size_t cnt = 0;
+
+    cnt += write(strm, scaling_factor);
+    cnt += write(strm, opts.refinement_floor);
+    cnt += write(strm, physcon.A);
+    cnt += write(strm, physcon.B);
+
+    cnt += write(strm, is_leaf);
+    cnt += write(strm, is_root);
+
+    for (integer f = 0; f != NF; ++f) {
+        for (integer i = H_BW; i < H_NX - H_BW; ++i) {
+            for (integer j = H_BW; j < H_NX - H_BW; ++j) {
+                const integer iii = hindex(i, j, H_BW);
+                cnt += write(strm, &U[f][iii], INX);
+            }
+        }
+    }
+    for (integer i = 0; i < G_NX; ++i) {
+        for (integer j = 0; j < G_NX; ++j) {
+            for (integer k = 0; k < G_NX; ++k) {
+                const integer iii = gindex(i, j, k);
+                for( integer f = 0; f != NGF; ++f ) {
+                    real tmp = G[iii][f];
+                    cnt += write(strm, tmp);
+                }
+            }
+        }
+    }
+    cnt += write(strm, U_out.data(), U_out.size());
+#ifdef RADIATION
+    cnt += rad_grid_ptr->save(strm);
+#endif
+    return cnt;
 }
 
